@@ -1,0 +1,35 @@
+services:
+  api:
+    build:
+      context: ./backend
+    container_name: rah_api
+    restart: always
+    environment:
+      DB_DSN: postgresql+asyncpg://rah:rahpw@host.docker.internal:5432/rah
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      GEN_MODEL: llama3.1:8b
+      EMBED_MODEL: nomic-embed-text
+      JWT_SECRET: supersecret_dev_key_change_me
+      JWT_EXPIRE_HOURS: "12"
+    ports:
+      - "8000:8000"
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  web:
+    build:
+      context: ./frontend
+    container_name: rah_web
+    restart: always
+    depends_on:
+      - api
+    ports:
+      - "5173:5173"
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: >
+      sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
