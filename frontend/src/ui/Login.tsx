@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { authLogin, setToken } from "../api";
 const API = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
 
 export default function Login({ onLogin }: { onLogin: () => void }){
@@ -28,6 +29,19 @@ export default function Login({ onLogin }: { onLogin: () => void }){
       setBusy(false)
     }
   }
+
+    const onSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setErr(null);
+        try {
+            const data = await authLogin(username, password);
+            setToken(data.access_token);              // 👈 store JWT
+            // navigate to / (or /home) after login
+            window.location.href = "/";
+        } catch (e: any) {
+            setErr(e.message ?? String(e));
+        }
+    };
 
   return (
     <div style={{display:'grid', placeItems:'center', height:'100vh', fontFamily:'sans-serif'}}>
