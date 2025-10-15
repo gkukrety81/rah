@@ -5,7 +5,10 @@ from ..db import SessionLocal
 from ..models import RahItem, PhysiologyProgram, RahItemProgram, CorpusDoc, CorpusChunk
 import math
 
-router = APIRouter()
+router = APIRouter(
+    prefix="/rah",
+    tags=["rah"]
+)
 
 class RahIn(BaseModel):
     rah_id: float
@@ -31,7 +34,7 @@ async def ensure_program_mapping(session, rah_id: float):
     if not exists.scalar_one_or_none():
         await session.execute(insert(RahItemProgram).values(rah_id=rah_id, program_code=code))
 
-@router.post("")
+@router.post("/")
 async def create_rah(item: RahIn):
     async with SessionLocal() as s:
         try:
@@ -60,7 +63,7 @@ async def get_rah(rah_id: float):
             "programs": programs
         }
 
-@router.get("")
+@router.get("/")
 async def list_rah(limit: int = 100, offset: int = 0):
     async with SessionLocal() as s:
         res = await s.execute(select(RahItem).order_by(RahItem.rah_id).limit(limit).offset(offset))

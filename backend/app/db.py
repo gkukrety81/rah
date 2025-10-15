@@ -1,11 +1,39 @@
+# backend/app/db.py
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase
+from typing import AsyncGenerator
 
-DB_DSN = os.getenv("DB_DSN", "postgresql+asyncpg://rah:rahpw@host.docker.internal:5432/rah")
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import declarative_base
 
-engine = create_async_engine(DB_DSN, echo=False, pool_pre_ping=True)
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+# ---- DB connection ----------------------------------------------------------
+# Use your local Postgres 16 by default.
+# Example: postgresql+asyncpg://<user>:<pass>@<host>:<port>/<db>
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://rah:rahpw@host.docker.internal:5432/rah",
+)
 
-class Base(DeclarativeBase):
-    pass
+engine = create_async_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,
+)
+
+SessionLocal = async_sessionmaker(
+    bind=engine,
+    expire_on_commit=False,
+    class_=AsyncSession,
+)
+
+Base = declarative_base()
+
+# ---- App/AI config (used elsewhere) ----------------------------------------
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
+GEN_MODEL = os.getenv("GEN_MODEL", "llama3.1:8b")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))
+
+# ---- FastAPI dependency -----------------------------------------------------
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    async with SessionLocal() as session:
+        yield session

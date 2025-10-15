@@ -3,8 +3,9 @@ from jose import jwt, JWTError
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
-from .db import SessionLocal
+from .db import SessionLocal, get_session
 from .models import UserAccount
+from sqlalchemy.ext.asyncio import AsyncSession
 
 SECRET = os.getenv("JWT_SECRET", "change_me")
 ALGO = "HS256"

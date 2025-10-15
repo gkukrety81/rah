@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy>=2.0
+asyncpg
+pydantic[email]
+argon2-cffi
+httpx
+openpyxl
+pypdf
+python-dotenv
+python-jose[cryptography]

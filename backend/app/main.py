@@ -1,23 +1,16 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from .routers import rah, programs, users, auth, ai
+from .routers import ai, rah, programs, users, auth, debug  # include ai here
 
-app = FastAPI(title="RAH AI Knowledge System API", version="0.3.0")
+app = FastAPI(title="RAH API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Routers
+app.include_router(ai.router)
+app.include_router(rah.router)
+app.include_router(programs.router)
+app.include_router(users.router)
+app.include_router(auth.router)
+app.include_router(debug.router)
 
-app.include_router(users.router, prefix="/users", tags=["users"])
-app.include_router(auth.router, prefix="/auth", tags=["auth"])
-app.include_router(rah.router, prefix="/rah", tags=["rah"])
-app.include_router(programs.router, prefix="/programs", tags=["programs"])
-app.include_router(ai.router, prefix="/ai", tags=["ai"])
-
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
