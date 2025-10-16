@@ -3,8 +3,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text as sa_text
+from sqlalchemy import update, select
 import re
 
+from ..models import RahItem
 from ..db import get_session, EMBED_DIM
 from ..ollama_client import ollama_embed, ollama_generate, to_pgvector_literal
 from ..embedding_refresh import refresh_embeddings as refresh_embeddings_helper
@@ -111,3 +113,26 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
     )
 
     return {"program_hints": codes, "matches": rows, "explanation": summary}
+
+@router.post("/generate-description/{rah_id}")
+async def generate_description(rah_id: float, session: AsyncSession = Depends(get_session)):
+    r = await session.execute(select(RahItem).where(RahItem.rah_id == rah_id))
+    item = r.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="RAH ID not found")
+
+    prompt = (
+        "Write a structured medical narrative (~1000 words) for the following RAH item. "
+        "Use clear sections: Overview, Physiology/Mechanism, Clinical Presentation, "
+        "Differential Considerations, Assessment, and Supportive/Therapeutic Notes. "
+        f"\n\nName: {item.details}\nCategory: {item.category}\n"
+    )
+    text = await ollama_generate(prompt)
+
+    await session.execute(
+        update(RahItem)
+        .where(RahItem.rah_id == rah_id)
+        .values(description=text)
+    )
+    await session.commit()
+    return {"ok": True}

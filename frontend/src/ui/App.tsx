@@ -1,48 +1,68 @@
-import React, { useEffect, useState } from 'react'
-import Login from './Login'
-import Landing from './Landing'
-import Users from './Users'
+// frontend/src/ui/App.tsx
+import React from "react";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 
-function authed(){ return !!localStorage.getItem('token') }
+import Login from "./Login";
+import Landing from "./Landing";
+import Users from "./Users";
+import RahPage from "./Rah";
+import AppShell from "./layout/AppShell";
 
-export default function App(){
-  const [isAuthed, setIsAuthed] = useState(authed())
-  const [tab, setTab] = useState(window.location.hash)
-
-  useEffect(()=>{
-    const h = () => setTab(window.location.hash)
-    window.addEventListener('hashchange', h)
-    return () => window.removeEventListener('hashchange', h)
-  }, [])
-
-  if(!isAuthed) return <Login onLogin={()=>setIsAuthed(true)} />
-
-  if(tab==='#users') return (
-    <div style={{fontFamily:'sans-serif'}}>
-      <Nav onLogout={()=>{localStorage.removeItem('token'); location.reload()}} />
-      <Users />
-    </div>
-  )
-
-  return (
-    <div style={{fontFamily:'sans-serif'}}>
-      <Nav onLogout={()=>{localStorage.removeItem('token'); location.reload()}} />
-      <div style={{padding:20}}>
-        <Landing />
-      </div>
-    </div>
-  )
+function isAuthed() {
+    return !!localStorage.getItem("token");
 }
 
-function Nav({onLogout}:{onLogout:()=>void}){
-  return (
-    <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', padding:'12px 20px', borderBottom:'1px solid #eee'}}>
-      <div style={{display:'flex', gap:16}}>
-        <b>RAH Manager</b>
-        <a href="#">Home</a>
-        <a href="#users">User Management</a>
-      </div>
-      <button onClick={onLogout}>Logout</button>
-    </div>
-  )
+// Simple auth guard that redirects to /login if not authenticated
+function Guard({ children }: { children: React.ReactNode }) {
+    const loc = useLocation();
+    if (!isAuthed()) {
+        return <Navigate to="/login" replace state={{ from: loc.pathname }} />;
+    }
+    return <>{children}</>;
+}
+
+export default function App() {
+    return (
+        <BrowserRouter>
+            <Routes>
+                {/* Public */}
+                <Route path="/login" element={<Login />} />
+
+                {/* Protected pages inside the enterprise shell */}
+                <Route
+                    path="/"
+                    element={
+                        <Guard>
+                            <AppShell>
+                                <Landing />
+                            </AppShell>
+                        </Guard>
+                    }
+                />
+                <Route
+                    path="/rah"
+                    element={
+                        <Guard>
+                            <AppShell>
+                                <RahPage />
+                            </AppShell>
+                        </Guard>
+                    }
+                />
+                <Route
+                    path="/users"
+                    element={
+                        <Guard>
+                            <AppShell>
+                                <Users />
+                            </AppShell>
+                        </Guard>
+                    }
+                />
+
+                {/* Fallback */}
+                <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+        </BrowserRouter>
+    );
 }
