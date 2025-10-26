@@ -1,24 +1,17 @@
-// frontend/src/ui/App.tsx
-import React from "react";
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
-
-import Login from "./Login";
-import Landing from "./Landing";
-import Users from "./Users";
-import RahPage from "./Rah";
+import { BrowserRouter, Routes, Route, Navigate, Outlet } from "react-router-dom";
 import AppShell from "./layout/AppShell";
+import Login from "./Login";
+import Landing from "./Landing";      // Home
+import RahPage from "./Rah";          // RAH table page
+import Checkup from "./Checkup";      // Check-up flow
+import Users from "./Users";          // User management
 
 function isAuthed() {
     return !!localStorage.getItem("token");
 }
 
-// Simple auth guard that redirects to /login if not authenticated
-function Guard({ children }: { children: React.ReactNode }) {
-    const loc = useLocation();
-    if (!isAuthed()) {
-        return <Navigate to="/login" replace state={{ from: loc.pathname }} />;
-    }
-    return <>{children}</>;
+function Guard() {
+    return isAuthed() ? <Outlet /> : <Navigate to="/login" replace />;
 }
 
 export default function App() {
@@ -28,40 +21,19 @@ export default function App() {
                 {/* Public */}
                 <Route path="/login" element={<Login />} />
 
-                {/* Protected pages inside the enterprise shell */}
-                <Route
-                    path="/"
-                    element={
-                        <Guard>
-                            <AppShell>
-                                <Landing />
-                            </AppShell>
-                        </Guard>
-                    }
-                />
-                <Route
-                    path="/rah"
-                    element={
-                        <Guard>
-                            <AppShell>
-                                <RahPage />
-                            </AppShell>
-                        </Guard>
-                    }
-                />
-                <Route
-                    path="/users"
-                    element={
-                        <Guard>
-                            <AppShell>
-                                <Users />
-                            </AppShell>
-                        </Guard>
-                    }
-                />
+                {/* Protected */}
+                <Route element={<Guard />}>
+                    <Route element={<AppShell />}>
+                        <Route index element={<Landing />} />
+                        <Route path="/" element={<Landing />} />
+                        <Route path="/rah" element={<RahPage />} />
+                        <Route path="/checkup" element={<Checkup />} />
+                        <Route path="/users" element={<Users />} />
+                    </Route>
+                </Route>
 
                 {/* Fallback */}
-                <Route path="*" element={<Navigate to="/" replace />} />
+                <Route path="*" element={<Navigate to={isAuthed() ? "/" : "/login"} replace />} />
             </Routes>
         </BrowserRouter>
     );

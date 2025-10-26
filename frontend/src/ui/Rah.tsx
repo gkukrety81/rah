@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import RahDescriptionDrawer from "./RahDescriptionDrawer";
 
 const API = import.meta.env.VITE_API_BASE || "http://localhost:8000";
-
 function authHeaders() {
     const t = localStorage.getItem("token");
     return t ? { Authorization: `Bearer ${t}` } : {};
@@ -14,130 +14,205 @@ type RahRow = {
     has_description: boolean;
 };
 
-type RahPayload =
-    | RahRow[]
-    | {
+type RahPageResp = {
     items: RahRow[];
-    total?: number;
-    limit?: number;
-    offset?: number;
+    total: number;
+    page: number;
+    page_size: number;
+};
+
+type RahDetail = {
+    rah_id: number;
+    details?: string;
+    category?: string;
+    description?: string | null;
 };
 
 export default function RahPage() {
     const [rows, setRows] = useState<RahRow[]>([]);
-    const [page, setPage] = useState(1);
-    const [total, setTotal] = useState<number | null>(null);
-    const limit = 25;
+    const [page, setPage] = useState<number>(1);
+    const [pageSize, setPageSize] = useState<number>(25);
+    const [total, setTotal] = useState<number>(0);
+    const [loading, setLoading] = useState<boolean>(false);
 
-    async function load(p = page) {
-        const offset = (p - 1) * limit;
-        const res = await fetch(`${API}/rah?limit=${limit}&offset=${offset}`, {
-            headers: { ...authHeaders() },
-        });
+    // Drawer state (uses the "item" prop pattern)
+    const [drawerItem, setDrawerItem] = useState<RahDetail | null>(null);
 
-        if (!res.ok) {
-            console.error("RAH fetch failed", await res.text());
-            setRows([]);
-            return;
-        }
-
-        const data: RahPayload = await res.json();
-
-        const items = Array.isArray(data) ? data : data.items ?? [];
-        setRows(items);
-
-        // If backend provides a total, use it for better paging.
-        if (!Array.isArray(data) && typeof data.total === "number") {
-            setTotal(data.total);
-        } else {
-            // Fallback: unknown total; set to a rolling minimum to keep pager sane.
-            const atLeast = offset + items.length;
-            setTotal((prev) => (prev === null ? atLeast : Math.max(prev, atLeast)));
+    async function load(p = page, ps = pageSize) {
+        setLoading(true);
+        try {
+            const r = await fetch(
+                `${API}/rah?page=${encodeURIComponent(p)}&page_size=${encodeURIComponent(ps)}`,
+                { headers: { ...authHeaders() } }
+            );
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const j: RahPageResp = await r.json();
+            setRows(Array.isArray(j.items) ? j.items : []);
+            setTotal(Number(j.total ?? 0));
+            setPage(Number(j.page ?? p));
+            setPageSize(Number(j.page_size ?? ps));
+        } finally {
+            setLoading(false);
         }
     }
 
+    // initial load
     useEffect(() => {
-        load(1);
+        load(1, pageSize);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    // when page changes, (re)load
     useEffect(() => {
-        load(page);
+        load(page, pageSize);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [page]);
 
+    // reset to page 1 if pageSize changes
+    useEffect(() => {
+        setPage(1);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [pageSize]);
+
+    const pages = useMemo(
+        () => Math.max(1, Math.ceil((total || 0) / (pageSize || 1))),
+        [total, pageSize]
+    );
     const canPrev = page > 1;
-    // If we know total, compute final page; if not, allow Next until an empty page shows up.
-    const knownTotal = total !== null;
-    const lastPage = knownTotal ? Math.max(1, Math.ceil((total as number) / limit)) : undefined;
-    const canNext = knownTotal ? page < (lastPage as number) : rows.length === limit;
+    const canNext = page < pages;
+
+    async function openDrawer(rahId: number) {
+        // fetch the full record (with description) before opening
+        try {
+            const r = await fetch(`${API}/rah/${rahId}`, { headers: { ...authHeaders() } });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const j: RahDetail = await r.json();
+            setDrawerItem(j);
+        } catch (e) {
+            console.error(e);
+            // open anyway with a minimal item so drawer can show a friendly message
+            const fallback = rows.find((x) => x.rah_id === rahId);
+            setDrawerItem({
+                rah_id: rahId,
+                details: fallback?.details,
+                category: fallback?.category,
+                description: null,
+            });
+        }
+    }
+
+    function closeDrawer(changed?: boolean) {
+        setDrawerItem(null);
+        if (changed) {
+            // if description was regenerated/edited inside drawer (future),
+            // reload current page to refresh the "Yes/No" badge
+            load(page, pageSize);
+        }
+    }
 
     return (
-        <div className="space-y-4">
-            <h2 className="text-xl font-semibold">RAH IDs</h2>
-
-            <div className="overflow-x-auto rounded-lg border bg-white">
-                <table className="min-w-full text-sm">
-                    <thead className="bg-slate-50 text-slate-600">
-                    <tr>
-                        <th className="px-4 py-3 text-left">RAH ID</th>
-                        <th className="px-4 py-3 text-left">Details</th>
-                        <th className="px-4 py-3 text-left">Category</th>
-                        <th className="px-4 py-3 text-left">Description</th>
-                    </tr>
-                    </thead>
-                    <tbody>
-                    {rows.map((r) => (
-                        <tr key={r.rah_id} className="border-t">
-                            <td className="px-4 py-3">{r.rah_id.toFixed(2)}</td>
-                            <td className="px-4 py-3">{r.details}</td>
-                            <td className="px-4 py-3">{r.category}</td>
-                            <td className="px-4 py-3">
-                                {r.has_description ? (
-                                    <span className="inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-emerald-700">
-                      Yes
-                    </span>
-                                ) : (
-                                    <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">
-                      No
-                    </span>
-                                )}
-                            </td>
-                        </tr>
-                    ))}
-
-                    {rows.length === 0 && (
-                        <tr>
-                            <td className="px-4 py-8 text-center text-slate-500" colSpan={4}>
-                                No data.
-                            </td>
-                        </tr>
-                    )}
-                    </tbody>
-                </table>
+        <div className="max-w-5xl mx-auto">
+            {/* Header */}
+            <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xl font-semibold">RAH IDs</h2>
+                <div className="flex items-center gap-3 text-sm">
+                    <span className="text-gray-500">Total: {total}</span>
+                    <select
+                        className="border rounded px-2 py-1"
+                        value={pageSize}
+                        onChange={(e) => setPageSize(parseInt(e.target.value, 10))}
+                    >
+                        {[10, 25, 50, 100].map((n) => (
+                            <option key={n} value={n}>
+                                {n} / page
+                            </option>
+                        ))}
+                    </select>
+                </div>
             </div>
 
-            {/* Pager */}
-            <div className="flex items-center gap-2">
+            {/* Table */}
+            <div className="border rounded-lg overflow-hidden bg-white">
+                <div className="grid grid-cols-[110px_1fr_220px_170px] bg-gray-50 px-4 py-2 text-sm font-medium">
+                    <div>RAH ID</div>
+                    <div>Details</div>
+                    <div>Category</div>
+                    <div>Description</div>
+                </div>
+
+                {loading ? (
+                    <div className="p-6 text-sm text-gray-500">Loading…</div>
+                ) : rows.length === 0 ? (
+                    <div className="p-6 text-sm text-gray-500">No items.</div>
+                ) : (
+                    rows.map((r) => (
+                        <div
+                            key={r.rah_id}
+                            className="grid grid-cols-[110px_1fr_220px_170px] px-4 py-3 border-t text-sm"
+                        >
+                            <div className="tabular-nums">{r.rah_id.toFixed(2)}</div>
+                            <div className="truncate">
+                                {r.details || <span className="text-gray-400">—</span>}
+                            </div>
+                            <div className="truncate">
+                                {r.category || <span className="text-gray-400">—</span>}
+                            </div>
+                            <div className="flex items-center gap-2">
+                <span
+                    className={
+                        "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium " +
+                        (r.has_description
+                            ? "bg-green-50 text-green-700 ring-1 ring-inset ring-green-600/20"
+                            : "bg-yellow-50 text-yellow-700 ring-1 ring-inset ring-yellow-600/20")
+                    }
+                >
+                  {r.has_description ? "Yes" : "No"}
+                </span>
+
+                                <button
+                                    className={
+                                        "ml-1 px-2 py-1 text-xs rounded border " +
+                                        (r.has_description
+                                            ? "hover:bg-gray-50"
+                                            : "opacity-60 cursor-not-allowed")
+                                    }
+                                    onClick={() => r.has_description && openDrawer(r.rah_id)}
+                                    disabled={!r.has_description}
+                                    title={r.has_description ? "View description" : "No description available"}
+                                >
+                                    View
+                                </button>
+                            </div>
+                        </div>
+                    ))
+                )}
+            </div>
+
+            {/* Pagination */}
+            <div className="flex items-center justify-between mt-4">
                 <button
-                    className="px-3 py-2 rounded-md border bg-white disabled:opacity-50"
-                    disabled={!canPrev}
+                    className="px-3 py-2 rounded border disabled:opacity-50"
                     onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    disabled={!canPrev}
                 >
                     Prev
                 </button>
-                <span className="text-sm text-slate-600">
-          Page {page}
-                    {knownTotal && lastPage ? ` / ${lastPage}` : ""}
-        </span>
+
+                <div className="text-sm text-gray-600">
+                    Page <span className="font-medium">{page}</span> / {pages}
+                </div>
+
                 <button
-                    className="px-3 py-2 rounded-md border bg-white disabled:opacity-50"
+                    className="px-3 py-2 rounded border disabled:opacity-50"
+                    onClick={() => setPage((p) => Math.min(pages, p + 1))}
                     disabled={!canNext}
-                    onClick={() => setPage((p) => p + 1)}
                 >
                     Next
                 </button>
             </div>
+
+            {/* Drawer (expects { item, onClose }) */}
+            <RahDescriptionDrawer item={drawerItem} onClose={() => closeDrawer(false)} />
         </div>
     );
 }

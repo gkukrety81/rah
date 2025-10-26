@@ -1,39 +1,51 @@
-const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
-function authHeader() {
+function authHeaders() {
     const t = localStorage.getItem("token");
     return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
-export async function aiAnalyze(prompt: string, top_k = 5) {
-    const res = await fetch(`${API}/ai/analyze`, {
+// Dedicated backend endpoint (preferred). Falls back gracefully if missing.
+export async function apiCheckup(
+    rahIds: number[],
+    selectedTicks: string[] = [],
+    practitionerNotes: string = ""
+) {
+    const r = await fetch(`${API_BASE}/ai/checkup`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeader() },
-        body: JSON.stringify({ prompt, top_k }),
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ rah_ids: rahIds, selected_ticks: selectedTicks, practitioner_notes: practitionerNotes }),
     });
-    if (!res.ok) throw new Error(`AI analyze failed: ${res.status} ${await res.text()}`);
-    return res.json();
+
+    if (r.status === 404) throw new Error("checkup endpoint not present");
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
 }
 
-export async function aiRefreshEmbeddings() {
-    const res = await fetch(`${API}/ai/refresh-embeddings`, {
-        method: "POST",
-        headers: { ...authHeader() },
-    });
-    if (!res.ok) throw new Error(`Refresh failed: ${res.status} ${await res.text()}`);
-    return res.json();
-}
+// Fallback using existing /ai/analyze so the page still works before backend is wired.
+export async function apiAnalyzeFallback(rahIds: number[]) {
+    const text = `Client indicates correlation between RAH IDs: ${rahIds.join(
+        ", "
+    )}. Please provide short analysis, potential indications and rebalancing guidance.`;
 
-export async function authLogin(username: string, password: string) {
-    const res = await fetch(`${API}/auth/login`, {
+    const r = await fetch(`${API_BASE}/ai/analyze`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ prompt: text, top_k: 5 }),
     });
-    if (!res.ok) throw new Error(`Login failed: ${res.status} ${await res.text()}`);
-    return res.json();
-}
 
-export function setToken(tok: string) {
-    localStorage.setItem("token", tok);
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+
+    // Shape it to our CheckupResult type
+    return {
+        comboTitle: `RAH ${rahIds.map((n) => n.toFixed(2)).join(" + ")}`,
+        analysis: j.explanation ?? "Analysis not available.",
+        suggestions: (j.matches ?? []).slice(0, 6).map((m: any) => ({
+            group: "Physical",
+            text: `${m.details} — ${m.category}`,
+        })),
+        recommendations:
+            "Adopt an integrative plan: regular gentle movement, anti-inflammatory diet, stress reduction, hydration; escalate to specialist referral if red flags persist.",
+    };
 }

@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routers import ai, rah, programs, users, auth, debug  # include ai here
+from .routers import ai, rah, programs, users, auth, debug, checkup  # include ai here
 
 app = FastAPI(title="RAH API")
 
@@ -24,6 +24,7 @@ app.include_router(programs.router)
 app.include_router(users.router)
 app.include_router(auth.router)
 app.include_router(debug.router)
+app.include_router(checkup.router)
 
 @app.get("/health")
 async def health():
