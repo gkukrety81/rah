@@ -7,6 +7,22 @@ from ..models import RahItem
 
 router = APIRouter(prefix="/rah", tags=["rah"])
 
+
+@router.get("/{rah_id}/description")
+async def get_description(rah_id: float, session: AsyncSession = Depends(get_session)):
+    r = await session.execute(
+        sa_text("SELECT details, description FROM rah_schema.rah_item WHERE rah_id=:x"), {"x": rah_id}
+    )
+    row = r.first()
+    if not row:
+        raise HTTPException(404, "Not found")
+    details, description = row
+    return {
+        "rah_id": rah_id,
+        "title": details or "",
+        "description": (description or "").strip()
+    }
+
 @router.get("")
 async def list_rah(
         page: int = Query(1, ge=1),

@@ -1,3 +1,9 @@
 @import "tailwindcss";
 /* custom shadow */
 .shadow-soft { box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06); }
+
+@media print {
+    nav, header, .no-print { display: none !important; }
+    .prose { color: #000; }
+    body { background: #fff; }
+}

@@ -1,241 +1,359 @@
-from fastapi import APIRouter, Depends, HTTPException
+# app/routers/checkup.py
+from __future__ import annotations
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Any
-from uuid import UUID
-from sqlalchemy import text as sa_text, select, insert, update
+from typing import List, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text as sa_text, select
 from ..db import get_session
-from ..auth_utils import get_current_user
+from ..models import RahItem
 from ..ollama_client import ollama_generate
+import json
+import hashlib
 
 router = APIRouter(prefix="/checkup", tags=["checkup"])
 
-# ---------- Models (Pydantic) ----------
-class CreateSessionIn(BaseModel):
-    rah_id_1: float
-    rah_id_2: float
-    rah_id_3: float
+# ---------- Pydantic ----------
+class StartIn(BaseModel):
+    rah_ids: List[float] = Field(..., min_items=3, max_items=3)
 
-class IndicationItem(BaseModel):
-    category: Literal["Physical", "Emotional", "Functional"]
-    label: str
-    selected: bool = False
+class Question(BaseModel):
+    id: str
+    text: str
+    group: str  # Physical | Psychological/Emotional | Functional
 
-class Stage2Payload(BaseModel):
-    combination: str
-    analysis: str
-    potential_indications: List[IndicationItem]
-    recommendations: Dict[str, List[str]]  # lifestyle, nutritional, emotional, bior, follow_up
+class StartOut(BaseModel):
+    case_id: str
+    rah_ids: List[float]
+    combination_title: str
+    analysis_blurb: str
+    questions: List[Question]
 
-class UpdateSessionIn(BaseModel):
-    practitioner_notes: Optional[str] = None
-    status: Optional[str] = None
+class AnswersIn(BaseModel):
+    case_id: str
+    selected: List[str] = []
+    notes: Optional[str] = None
+
+class AnalyzeIn(BaseModel):
+    case_id: str
 
 class AnalyzeOut(BaseModel):
-    correlated_systems: List[str]
-    interpretation: List[Dict[str, str]]
-    note_synthesis: str
-    diagnostic_summary: str
-    recommendations: Dict[str, List[str]]
+    case_id: str
+    sections: Dict[str, Any]
+    markdown: str
 
-# ---------- Helpers ----------
-async def _require_owner(sess: AsyncSession, session_id: UUID, user_id: UUID) -> None:
-    row = await sess.execute(sa_text("""
-                                     SELECT created_by FROM rah_schema.checkup_session WHERE id = :id
-                                     """), {"id": str(session_id)})
-    r = row.first()
-    if not r: raise HTTPException(404, "Session not found")
-    if str(r[0]) != str(user_id): raise HTTPException(403, "Forbidden")
+class TranslateIn(BaseModel):
+    case_id: str
+    target_lang: str = "de"  # ISO-ish short code; we’ll use prompts
 
-# ---------- Stage 1: Create ----------
-@router.post("/sessions")
-async def create_session(body: CreateSessionIn, user=Depends(get_current_user), session: AsyncSession = Depends(get_session)):
-    res = await session.execute(sa_text("""
-                                        INSERT INTO rah_schema.checkup_session (created_by, rah_id_1, rah_id_2, rah_id_3, status)
-                                        VALUES (:u, :a, :b, :c, 'draft') RETURNING id
-                                        """), {"u": str(user.user_id), "a": body.rah_id_1, "b": body.rah_id_2, "c": body.rah_id_3})
-    id_ = res.scalar_one()
+# ---------- Helpers / Prompts ----------
+COMBO_TITLE_SYS = (
+    "You are given three physiology items. "
+    "1) Return a concise 'Combination:' line (<=140 chars) naming overlapping systems. "
+    "2) Return a 1–2 sentence neutral 'Analysis:' blurb describing likely shared dysfunction."
+)
+
+# We stabilize output by instructing strict JSON and fixed grouping & count.
+QUESTION_SYS = (
+    "You create a deterministic yes/no questionnaire from three physiology items. "
+    "Return EXACTLY 10 items grouped across these buckets: "
+    "['Physical','Psychological/Emotional','Functional'] with at least 2 items each. "
+    "IDs must be stable, kebab-case, and derived from the text itself (e.g., 'reduced-venous-return'). "
+    "Return pure JSON array only, with objects: {\"id\",\"text\",\"group\"}. "
+    "NO prose. NO markdown. NO comments. Deterministic phrasing."
+)
+
+ANALYZE_SYS = (
+    "You are a clinical summarizer. Using selected YES/NO indicators and notes, "
+    "return a JSON object with keys and exact shapes:\n"
+    "{\n"
+    "  \"correlated_systems\": [str, str, str],\n"
+    "  \"indications\": [str, str, str],\n"
+    "  \"note_synthesis\": str,\n"
+    "  \"diagnostic_summary\": str,  // ~200 words\n"
+    "  \"recommendations\": {\n"
+    "    \"lifestyle\": [str], \"nutritional\": [str], \"emotional\": [str], \"bioresonance\": [str], \"follow_up\": [str]\n"
+    "  }\n"
+    "}\n"
+    "Return JSON ONLY."
+)
+
+TRANSLATE_SYS = (
+    "Translate the provided markdown into the target language while preserving headings, bullet lists, and formatting. "
+    "Do not add or remove content. Return only the translated markdown."
+)
+
+# ---------- Tables ----------
+CREATE_CASE_SQL = """
+                  CREATE TABLE IF NOT EXISTS rah_schema.checkup_case(
+                                                                        case_id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                      rah_ids        numeric(5,2)[] NOT NULL,
+                      combination    text,
+                      analysis_blurb text,
+                      questions      jsonb,
+                      answers        jsonb,
+                      notes          text,
+                      results        jsonb,
+                      created_at     timestamptz NOT NULL DEFAULT now()
+                      ); \
+                  """
+
+# Q-bank: one row per sorted triple of RAH IDs
+CREATE_QBANK_SQL = """
+                   CREATE TABLE IF NOT EXISTS rah_schema.checkup_qbank(
+                                                                          qkey          text PRIMARY KEY,
+                                                                          rah_ids       numeric(5,2)[] NOT NULL,
+                       combination   text,
+                       analysis_blurb text,
+                       questions     jsonb,
+                       created_at    timestamptz NOT NULL DEFAULT now()
+                       ); \
+                   """
+
+async def _ensure_tables(session: AsyncSession):
+    await session.execute(sa_text(CREATE_CASE_SQL))
+    await session.execute(sa_text(CREATE_QBANK_SQL))
     await session.commit()
-    return {"id": str(id_)}
 
-# ---------- Get / Update ----------
-@router.get("/sessions/{session_id}")
-async def get_session_full(session_id: UUID, session: AsyncSession = Depends(get_session), user=Depends(get_current_user)):
-    await _require_owner(session, session_id, user.user_id)
-    q = await session.execute(sa_text("""
-                                      SELECT id, created_by, rah_id_1, rah_id_2, rah_id_3, status, practitioner_notes, stage2_payload::text
-                                      FROM rah_schema.checkup_session WHERE id = :id
-                                      """), {"id": str(session_id)})
-    s = q.first()
-    if not s: raise HTTPException(404, "Not found")
+def _triple_key(rah_ids: List[float]) -> str:
+    triple = ",".join(f"{x:.2f}" for x in sorted(rah_ids))
+    return hashlib.md5(triple.encode("utf-8")).hexdigest()
 
-    ind = await session.execute(sa_text("""
-                                        SELECT category, label, selected FROM rah_schema.checkup_indication WHERE session_id = :id ORDER BY category, label
-                                        """), {"id": str(session_id)})
+async def _fetch_rah_descriptions(session: AsyncSession, rah_ids: List[float]) -> Dict[float, str]:
+    q = await session.execute(
+        select(RahItem.rah_id, RahItem.details, RahItem.description).where(RahItem.rah_id.in_(rah_ids))
+    )
+    by_id: Dict[float, str] = {}
+    for rid, details, desc in q.all():
+        by_id[float(rid)] = (desc or "").strip() or (details or "").strip()
+    return by_id
 
-    res = await session.execute(sa_text("""
-                                        SELECT correlated_systems::text, interpretation::text, note_synthesis, diagnostic_summary, recommendations::text
-                                        FROM rah_schema.checkup_result WHERE session_id = :id
-                                        """), {"id": str(session_id)})
+# ---------- Endpoints ----------
 
-    r = res.first()
-    return {
-        "session": {
-            "id": str(s[0]), "rah_id_1": float(s[2]), "rah_id_2": float(s[3]), "rah_id_3": float(s[4]),
-            "status": s[5], "practitioner_notes": s[6],
-            "stage2_payload": s[7] and s[7]
-        },
-        "indications": [dict(row._mapping) for row in ind.fetchall()],
-        "result": r and {
-            "correlated_systems": r[0] and r[0],
-            "interpretation": r[1] and r[1],
-            "note_synthesis": r[2],
-            "diagnostic_summary": r[3],
-            "recommendations": r[4] and r[4],
-        }
-    }
+@router.post("/start", response_model=StartOut)
+async def start(payload: StartIn, session: AsyncSession = Depends(get_session)):
+    await _ensure_tables(session)
+    if len(payload.rah_ids) != 3:
+        raise HTTPException(400, "Exactly 3 RAH IDs are required.")
 
-@router.patch("/sessions/{session_id}")
-async def update_session(session_id: UUID, body: UpdateSessionIn, session: AsyncSession = Depends(get_session), user=Depends(get_current_user)):
-    await _require_owner(session, session_id, user.user_id)
-    await session.execute(sa_text("""
-                                  UPDATE rah_schema.checkup_session
-                                  SET practitioner_notes = COALESCE(:notes, practitioner_notes),
-                                      status = COALESCE(:status, status),
-                                      updated_at = now()
-                                  WHERE id = :id
-                                  """), {"id": str(session_id), "notes": body.practitioner_notes, "status": body.status})
-    await session.commit()
-    return {"ok": True}
+    # Use descriptions as context; ensures grounded & repeatable signals
+    by_id = await _fetch_rah_descriptions(session, payload.rah_ids)
+    if len(by_id) < 3:
+        missing = [x for x in payload.rah_ids if x not in by_id]
+        raise HTTPException(400, f"Unknown RAH IDs: {missing}")
 
-# ---------- Stage 2 generation ----------
-@router.post("/sessions/{session_id}/stage2")
-async def build_stage2(session_id: UUID, session: AsyncSession = Depends(get_session), user=Depends(get_current_user)):
-    await _require_owner(session, session_id, user.user_id)
-    r = await session.execute(sa_text("""
-                                      SELECT rah_id_1, rah_id_2, rah_id_3
-                                      FROM rah_schema.checkup_session WHERE id = :id
-                                      """), {"id": str(session_id)})
-    row = r.first();
-    if not row: raise HTTPException(404, "Not found")
-    a, b, c = float(row[0]), float(row[1]), float(row[2])
+    context = "\n\n".join([f"RAH {rid:.2f}:\n{by_id[rid]}" for rid in payload.rah_ids])
 
-    # Fetch source texts for the three RAH IDs
-    src = await session.execute(sa_text("""
-                                        SELECT rah_id, COALESCE(NULLIF(description,''), details) AS text
-                                        FROM rah_schema.rah_item
-                                        WHERE rah_id IN (:a,:b,:c) ORDER BY rah_id
-                                        """), {"a": a, "b": b, "c": c})
-    snippets = [f"{float(r[0]):.2f} — {r[1]}" for r in src.fetchall()]
+    # Check Q-bank cache first
+    qkey = _triple_key(payload.rah_ids)
+    row = await session.execute(sa_text(
+        "SELECT combination, analysis_blurb, questions FROM rah_schema.checkup_qbank WHERE qkey=:k"
+    ), {"k": qkey})
+    cached = row.first()
 
-    prompt = f"""
-You are a clinical assistant. Given three RAH items and their narratives, produce Stage-2 content in JSON only.
+    if cached:
+        combination, blurb, questions_json = cached
+        questions = questions_json or []
+    else:
+        # Generate combo + analysis
+        combo_raw = await ollama_generate(
+            f"Descriptions from three RAH items:\n\n{context}\n\n"
+            "Return two lines exactly labeled 'Combination:' and 'Analysis:'",
+            system=COMBO_TITLE_SYS
+        )
+        combination, blurb = "", ""
+        for line in combo_raw.splitlines():
+            if line.lower().startswith("combination:"):
+                combination = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("analysis:"):
+                blurb = line.split(":", 1)[1].strip()
 
-RAH sources:
-{chr(10).join('- ' + s for s in snippets)}
+        # Generate deterministic questionnaire (10 items, stable groups)
+        qjson_text = await ollama_generate(
+            f"Descriptions from three RAH items:\n\n{context}\n\nReturn JSON array now.",
+            system=QUESTION_SYS
+        )
+        try:
+            parsed = json.loads(qjson_text)
+            questions = []
+            for q in parsed:
+                if isinstance(q, dict) and {"id", "text", "group"} <= set(q):
+                    # normalize
+                    questions.append({
+                        "id": str(q["id"]),
+                        "text": str(q["text"]),
+                        "group": str(q["group"])
+                    })
+        except Exception:
+            questions = []
 
-Respond strictly as JSON with keys:
-combination: string,
-analysis: string,
-potential_indications: array of objects {{category: "Physical"|"Emotional"|"Functional", label: string}},
-recommendations: object {{
-  lifestyle: string[], nutritional: string[], emotional: string[], bior: string[], follow_up: string[]
-}}
-"""
-    raw = await ollama_generate(prompt, system="Return valid, compact JSON. No prose outside JSON.")
-    # raw is a string; store as text JSON
-    await session.execute(sa_text("""
-                                  UPDATE rah_schema.checkup_session
-                                  SET stage2_payload = :j::jsonb, status='questionnaire', updated_at=now()
-                                  WHERE id = :id
-                                  """), {"id": str(session_id), "j": raw})
-    # seed indications table
-    await session.execute(sa_text("DELETE FROM rah_schema.checkup_indication WHERE session_id=:id"), {"id": str(session_id)})
-    await session.execute(sa_text("""
-                                  INSERT INTO rah_schema.checkup_indication(session_id, category, label, selected)
-                                  SELECT :id, (i->>'category'), (i->>'label'), false
-                                  FROM jsonb_path_query(:j::jsonb, '$.potential_indications[*]') AS i
-                                  """), {"id": str(session_id), "j": raw})
-    await session.commit()
-    return {"ok": True}
-
-# ---------- Save indications ----------
-@router.post("/sessions/{session_id}/indications")
-async def save_indications(session_id: UUID, items: List[IndicationItem], session: AsyncSession = Depends(get_session), user=Depends(get_current_user)):
-    await _require_owner(session, session_id, user.user_id)
-    # simple upsert
-    for it in items:
+        # Store to Q-bank
         await session.execute(sa_text("""
-                                      INSERT INTO rah_schema.checkup_indication(session_id, category, label, selected)
-                                      VALUES (:id, :cat, :lbl, :sel)
-                                          ON CONFLICT (session_id, category, label) DO UPDATE SET selected=EXCLUDED.selected
-                                      """.replace("ON CONFLICT (session_id, category, label)",
-                                                  "ON CONFLICT DO NOTHING")),  # if you want a true composite unique, add it in DDL
-                              {"id": str(session_id), "cat": it.category, "lbl": it.label, "sel": it.selected})
+                                      INSERT INTO rah_schema.checkup_qbank (qkey, rah_ids, combination, analysis_blurb, questions)
+                                      VALUES (:k, :ids, :c, :b, CAST(:q AS jsonb))
+                                          ON CONFLICT (qkey) DO NOTHING
+                                      """), {"k": qkey, "ids": sorted(payload.rah_ids), "c": combination, "b": blurb, "q": json.dumps(questions)})
+        await session.commit()
+
+    # Create a case using cached/generated
+    row = await session.execute(sa_text("""
+                                        INSERT INTO rah_schema.checkup_case (rah_ids, combination, analysis_blurb, questions)
+                                        VALUES (:ids, :c, :b, CAST(:q AS jsonb))
+                                            RETURNING case_id::text
+                                        """), {"ids": payload.rah_ids, "c": combination, "b": blurb, "q": json.dumps(questions)})
+    case_id = row.scalar_one()
+    await session.commit()
+
+
+    return StartOut(
+        case_id=case_id,
+        rah_ids=payload.rah_ids,
+        combination_title=combination or "Combination",
+        analysis_blurb=blurb or "",
+        questions=[Question(**q) for q in (questions or [])]
+    )
+
+@router.post("/answers")
+async def save_answers(payload: AnswersIn, session: AsyncSession = Depends(get_session)):
+    await _ensure_tables(session)
     await session.execute(sa_text("""
-                                  UPDATE rah_schema.checkup_session SET status='notes', updated_at=now() WHERE id=:id
-                                  """), {"id": str(session_id)})
+                                  UPDATE rah_schema.checkup_case
+                                  SET answers = CAST(:a AS jsonb), notes=:n
+                                  WHERE case_id=:cid
+                                  """), {"a": json.dumps(payload.selected or []), "n": payload.notes or "", "cid": payload.case_id})
     await session.commit()
     return {"ok": True}
 
-# ---------- Stage 4/5 Analysis ----------
-@router.post("/sessions/{session_id}/analyze")
-async def analyze(session_id: UUID, session: AsyncSession = Depends(get_session), user=Depends(get_current_user)):
-    await _require_owner(session, session_id, user.user_id)
-    q = await session.execute(sa_text("""
-                                      SELECT rah_id_1, rah_id_2, rah_id_3, practitioner_notes, stage2_payload::text
-                                      FROM rah_schema.checkup_session WHERE id=:id
-                                      """), {"id": str(session_id)})
-    s = q.first()
-    if not s: raise HTTPException(404, "Not found")
-    a,b,c, notes, stage2 = float(s[0]), float(s[1]), float(s[2]), (s[3] or ""), (s[4] or "{}")
+@router.post("/analyze", response_model=AnalyzeOut)
+async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_session)):
+    await _ensure_tables(session)
+    res = await session.execute(sa_text("""
+                                        SELECT case_id::text, rah_ids, combination, analysis_blurb, questions, answers, notes
+                                        FROM rah_schema.checkup_case WHERE case_id=:cid
+                                        """), {"cid": payload.case_id})
+    row = res.first()
+    if not row:
+        raise HTTPException(404, "Unknown case_id")
+    case_id, rah_ids, combination, blurb, questions_json, answers_json, notes = row
 
-    ind = await session.execute(sa_text("""
-                                        SELECT category, label, selected FROM rah_schema.checkup_indication
-                                        WHERE session_id=:id ORDER BY category, label
-                                        """), {"id": str(session_id)})
-    chosen = [dict(r._mapping) for r in ind.fetchall()]
+    # Build selected questions summary
+    questions = questions_json or []
+    selected_ids = set(answers_json or [])
+    picked = [q for q in questions if q.get("id") in selected_ids]
 
-    prompt = f"""
-You are a clinical reasoning engine. Using the selected indications and practitioner notes,
-produce a structured JSON report with keys:
-correlated_systems: string[]  (3–5 bullet items),
-interpretation: array of objects {{title: string, body: string}},
-note_synthesis: string,
-diagnostic_summary: string,   -- 200–1000 words, coherent and professional, no diagnoses
-recommendations: object {{ lifestyle: string[], nutritional: string[], emotional: string[], bior: string[], follow_up: string[] }}
+    # Ground context again
+    by_id = await _fetch_rah_descriptions(session, rah_ids)
+    context = "\n\n".join([f"RAH {float(r):.2f}:\n{by_id.get(float(r),'')}" for r in rah_ids])
 
-Inputs:
-RAH IDs: {a:.2f}, {b:.2f}, {c:.2f}
-Stage2 summary (JSON string): {stage2}
-Selected indications: {chosen}
-Practitioner notes: {notes}
+    user_prompt = (
+            f"Combination: {combination}\n"
+            f"Short analysis: {blurb}\n\n"
+            f"Descriptions:\n{context}\n\n"
+            f"Selected indicators (YES):\n" +
+            "\n".join([f"- [{q.get('group')}] {q.get('text')}" for q in picked]) +
+            f"\n\nPractitioner notes:\n{notes or '(none)'}\n\nReturn JSON only."
+    )
 
-Return JSON only. Keep it concise and grounded in the inputs. Avoid medical claims; use advisory language.
-"""
-    raw = await ollama_generate(prompt, system="Return valid JSON. No extra text.")
+    raw = await ollama_generate(user_prompt, system=ANALYZE_SYS)
+    try:
+        sections = json.loads(raw)
+    except Exception:
+        sections = {
+            "correlated_systems": [],
+            "indications": [],
+            "note_synthesis": "",
+            "diagnostic_summary": raw.strip(),
+            "recommendations": {
+                "lifestyle": [], "nutritional": [], "emotional": [], "bioresonance": [], "follow_up": []
+            }
+        }
+
     await session.execute(sa_text("""
-                                  INSERT INTO rah_schema.checkup_result(
-                                      session_id, correlated_systems, interpretation, note_synthesis, diagnostic_summary, recommendations, raw_model_output
-                                  )
-                                  SELECT :id,
-                                         (j->'correlated_systems')::jsonb,
-                                      (j->'interpretation')::jsonb,
-                                      (j->>'note_synthesis'),
-                                         (j->>'diagnostic_summary'),
-                                         (j->'recommendations')::jsonb,
-                                      j::jsonb
-                                  FROM (SELECT :raw::jsonb AS j) x
-                                      ON CONFLICT (session_id) DO UPDATE
-                                                                      SET correlated_systems = EXCLUDED.correlated_systems,
-                                                                      interpretation     = EXCLUDED.interpretation,
-                                                                      note_synthesis     = EXCLUDED.note_synthesis,
-                                                                      diagnostic_summary = EXCLUDED.diagnostic_summary,
-                                                                      recommendations    = EXCLUDED.recommendations,
-                                                                      raw_model_output   = EXCLUDED.raw_model_output
-                                  """), {"id": str(session_id), "raw": raw})
-    await session.execute(sa_text("""
-                                  UPDATE rah_schema.checkup_session SET status='analyzed', updated_at=now() WHERE id=:id
-                                  """), {"id": str(session_id)})
+                                  UPDATE rah_schema.checkup_case SET results=CAST(:r AS jsonb) WHERE case_id=:cid
+                                  """), {"r": json.dumps(sections), "cid": case_id})
     await session.commit()
-    return {"ok": True}
+
+    def bullets(items):
+        return "\n".join([f"- {x}" for x in (items or [])])
+    rec = sections.get("recommendations", {}) or {}
+    md = f"""# RAI Analysis
+
+## Correlated Systems Analysis
+{bullets(sections.get("correlated_systems", []))}
+
+## Indication Interpretation
+{bullets(sections.get("indications", []))}
+
+## Note Synthesis
+{sections.get("note_synthesis","")}
+
+## 200-Word Diagnostic Summary
+{sections.get("diagnostic_summary","")}
+
+## Tailored Recommendations
+**Lifestyle**  
+{bullets(rec.get("lifestyle", []))}
+
+**Nutritional**  
+{bullets(rec.get("nutritional", []))}
+
+**Emotional**  
+{bullets(rec.get("emotional", []))}
+
+**Rayonex Bioresonance**  
+{bullets(rec.get("bioresonance", []))}
+
+**Follow-Up**  
+{bullets(rec.get("follow_up", []))}
+""".strip()
+
+    return AnalyzeOut(case_id=case_id, sections=sections, markdown=md)
+
+@router.post("/translate")
+async def translate(payload: TranslateIn, session: AsyncSession = Depends(get_session)):
+    # Load last results
+    r = await session.execute(sa_text("SELECT results FROM rah_schema.checkup_case WHERE case_id=:c"), {"c": payload.case_id})
+    row = r.first()
+    if not row or not row[0]:
+        raise HTTPException(404, "No results for case")
+    results = row[0]
+    # Rebuild the markdown the same way analyze() does
+    def bullets(items): return "\n".join([f"- {x}" for x in (items or [])])
+    rec = results.get("recommendations", {}) or {}
+    md = f"""# RAI Analysis
+
+## Correlated Systems Analysis
+{bullets(results.get("correlated_systems", []))}
+
+## Indication Interpretation
+{bullets(results.get("indications", []))}
+
+## Note Synthesis
+{results.get("note_synthesis","")}
+
+## 200-Word Diagnostic Summary
+{results.get("diagnostic_summary","")}
+
+## Tailored Recommendations
+**Lifestyle**  
+{bullets(rec.get("lifestyle", []))}
+
+**Nutritional**  
+{bullets(rec.get("nutritional", []))}
+
+**Emotional**  
+{bullets(rec.get("emotional", []))}
+
+**Rayonex Bioresonance**  
+{bullets(rec.get("bioresonance", []))}
+
+**Follow-Up**  
+{bullets(rec.get("follow_up", []))}
+""".strip()
+
+    lang_label = {"de": "German", "fr": "French", "it": "Italian", "es": "Spanish"}.get(payload.target_lang.lower(), payload.target_lang)
+    translated = await ollama_generate(
+        f"Target language: {lang_label}\n\nMarkdown to translate:\n\n{md}",
+        system=TRANSLATE_SYS
+    )
+    return {"markdown": translated}

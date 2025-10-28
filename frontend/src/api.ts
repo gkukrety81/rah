@@ -1,51 +1,109 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+// frontend/src/api.ts
+// Base URL + auth helper
+export const API =
+    (import.meta as any).env?.VITE_API_BASE || "http://localhost:8000";
 
-function authHeaders() {
+export function authHeaders() {
     const t = localStorage.getItem("token");
     return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
-// Dedicated backend endpoint (preferred). Falls back gracefully if missing.
-export async function apiCheckup(
-    rahIds: number[],
-    selectedTicks: string[] = [],
-    practitionerNotes: string = ""
-) {
-    const r = await fetch(`${API_BASE}/ai/checkup`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ rah_ids: rahIds, selected_ticks: selectedTicks, practitioner_notes: practitionerNotes }),
-    });
-
-    if (r.status === 404) throw new Error("checkup endpoint not present");
-    if (!r.ok) throw new Error(await r.text());
+async function fetchJson(input: RequestInfo, init?: RequestInit) {
+    const r = await fetch(input, init);
+    if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new Error(`HTTP ${r.status} ${r.statusText} ${text}`);
+    }
     return r.json();
 }
 
-// Fallback using existing /ai/analyze so the page still works before backend is wired.
-export async function apiAnalyzeFallback(rahIds: number[]) {
-    const text = `Client indicates correlation between RAH IDs: ${rahIds.join(
-        ", "
-    )}. Please provide short analysis, potential indications and rebalancing guidance.`;
+/* ========= RAH ========= */
 
-    const r = await fetch(`${API_BASE}/ai/analyze`, {
+export async function getRahPage(page = 1, page_size = 25) {
+    return fetchJson(
+        `${API}/rah?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(
+            page_size
+        )}`,
+        { headers: { ...authHeaders() } }
+    );
+}
+
+/* ========= Auth (if you use them elsewhere) ========= */
+
+export async function login(username: string, password: string) {
+    return fetchJson(`${API}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+    });
+}
+
+export async function me() {
+    return fetchJson(`${API}/auth/me`, { headers: { ...authHeaders() } });
+}
+
+/* ========= Checkup (Stage 1–5) ========= */
+
+// Stage 1: start checkup with three RAH IDs
+export async function startCheckup(rah_ids: number[]) {
+    return fetchJson(`${API}/checkup/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ prompt: text, top_k: 5 }),
+        body: JSON.stringify({ rah_ids }),
     });
-
-    if (!r.ok) throw new Error(await r.text());
-    const j = await r.json();
-
-    // Shape it to our CheckupResult type
-    return {
-        comboTitle: `RAH ${rahIds.map((n) => n.toFixed(2)).join(" + ")}`,
-        analysis: j.explanation ?? "Analysis not available.",
-        suggestions: (j.matches ?? []).slice(0, 6).map((m: any) => ({
-            group: "Physical",
-            text: `${m.details} — ${m.category}`,
-        })),
-        recommendations:
-            "Adopt an integrative plan: regular gentle movement, anti-inflammatory diet, stress reduction, hydration; escalate to specialist referral if red flags persist.",
-    };
 }
+
+export async function saveAnswers(case_id: string, selected: string[], notes: string) {
+    return fetchJson(`${API}/checkup/answers`, {
+        method: "POST",
+        body: JSON.stringify({ case_id, selected, notes }),
+    });
+}
+
+
+// Stage 3: save selected answers + practitioner notes
+export async function saveCheckupAnswers(
+    case_id: string,
+    answers: string[],
+    notes: string
+) {
+    return fetchJson(`${API}/checkup/answers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ case_id, answers, notes }),
+    });
+}
+
+// Stage 4: run AI analysis -> markdown
+export async function analyzeCheckup(case_id: string) {
+    return fetchJson(`${API}/checkup/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ case_id }),
+    });
+}
+
+// Open an existing case (for history)
+export async function fetchCase(case_id: string) {
+    return fetchJson(`${API}/checkup/${encodeURIComponent(case_id)}`, {
+        headers: { ...authHeaders() },
+    });
+}
+
+// History list
+export async function listCheckups(limit = 25, offset = 0) {
+    return fetchJson(`${API}/checkup?limit=${limit}&offset=${offset}`, {
+        headers: { ...authHeaders() },
+    });
+}
+
+// Translate Stage 4/5 markdown (e.g., to German)
+export async function translateCheckup(caseId: string, lang = "de") {
+    return fetchJson(`${API}/checkup/translate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ case_id: caseId, target_lang: lang }),
+    });
+}
+
+/* ========= (Optional) other existing API helpers can live here ========= */
