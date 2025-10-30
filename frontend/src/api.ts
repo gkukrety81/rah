@@ -60,6 +60,24 @@ export async function saveAnswers(case_id: string, selected: string[], notes: st
     });
 }
 
+export async function listCases(limit = 25) {
+    const r = await fetch(`${import.meta.env.VITE_API}/checkup/history?limit=${limit}`, {
+        credentials: "include",
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+    return r.json();
+}
+
+export async function translateMarkdown(text: string, target_lang = "de") {
+    const r = await fetch(`${import.meta.env.VITE_API}/ai/translate`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, target_lang }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+    return r.json();
+}
 
 // Stage 3: save selected answers + practitioner notes
 export async function saveCheckupAnswers(

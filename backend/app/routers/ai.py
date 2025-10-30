@@ -12,7 +12,26 @@ from ..ollama_client import ollama_embed, ollama_generate, to_pgvector_literal
 from ..embedding_refresh import refresh_embeddings as refresh_embeddings_helper
 
 router = APIRouter(prefix="/ai", tags=["ai"])
+ai_router = APIRouter(prefix="/ai", tags=["ai"])
 
+class TranslateIn(BaseModel):
+    text: str
+    target_lang: str = "de"  # ISO-ish tag, default German
+
+class TranslateOut(BaseModel):
+    text: str
+    lang: str
+
+_TRANSLATE_SYS = (
+    "You are a precise medical translator. Translate the user content to the target language. "
+    "Preserve markdown structure, headings, bullets, and clinical tone. Do not add extra commentary."
+)
+
+@ai_router.post("/translate", response_model=TranslateOut)
+async def translate(inb: TranslateIn) -> TranslateOut:
+    user = f"Target language: {inb.target_lang}\n\nContent:\n{inb.text}"
+    out = await ollama_generate(user, system=_TRANSLATE_SYS)
+    return TranslateOut(text=out.strip(), lang=inb.target_lang)
 
 class AnalyzeIn(BaseModel):
     prompt: str

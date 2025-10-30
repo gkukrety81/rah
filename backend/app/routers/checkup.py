@@ -285,6 +285,39 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
                                   WHERE case_id = :cid
                                   """), {"res": json.dumps(sections), "cid": case_id})
     await session.commit()
+
+    # --- New: recent case history -------------------------------------------------
+from typing import Any
+
+@router.get("/history")
+async def list_history(limit: int = 25, session: AsyncSession = Depends(get_session)) -> Any:
+    """
+    Return the most recent cases for the Case History drawer.
+    """
+    await _ensure_table_runtime(session)
+    r = await session.execute(sa_text("""
+                                      SELECT case_id::text,
+                                          rah_ids,
+                                             combination,
+                                             analysis_blurb,
+                                             recommendations,
+                                             created_at,
+                                             COALESCE(source,'ai') AS source
+                                      FROM rah_schema.checkup_case
+                                      ORDER BY created_at DESC
+                                          LIMIT :lim
+                                      """), {"lim": max(1, min(100, limit))})
+    rows = [{
+        "case_id": row[0],
+        "rah_ids": row[1],
+        "combination": row[2],
+        "analysis_blurb": row[3],
+        "recommendations": row[4],
+        "created_at": row[5].isoformat(),
+        "source": row[6],
+    } for row in r.fetchall()]
+    return {"items": rows}
+
     # Pretty markdown for Stage 4/5
     def bullets(items):
         return "\n".join([f"- {x}" for x in (items or [])])
