@@ -7,8 +7,7 @@ import json
 import os
 import random
 import signal
-import time
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict
 
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,55 +15,59 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import SessionLocal
 from app.ollama_client import ollama_generate
 
-# ============================================================
-# Single LLM call per triad (faster + more consistent)
-# ============================================================
-
-ONE_CALL_SYS = (
-    "You are generating structured clinical scaffolding from three clinician-authored "
-    "base profiles (physiology programs). "
-    "Return ONE compact JSON object and NOTHING else. "
-    "Schema:\n"
-    "{\n"
-    '  "combination": "Concise title (<=140 chars)",\n'
-    '  "analysis": "1–2 sentence neutral blurb",\n'
-    '  "potential_indications": {\n'
-    '    "Physical": ["..."],\n'
-    '    "Psychological/Emotional": ["..."],\n'
-    '    "Functional": ["..."]\n'
-    "  },\n"
-    '  "recommendations": ["bullet", "bullet", "..."]\n'
-    "}\n"
-    "Rules:\n"
-    "- JSON ONLY. No prose outside JSON.\n"
-    "- 8–12 total potential indications across the three groups; short, specific YES/NO style items.\n"
-    "- 5–8 recommendation bullets (diet, lifestyle, emotional regulation, stress, follow-up).\n"
-    "Neutral, professional tone."
+# ----------------------- Prompt templates -----------------------
+COMBO_TITLE_SYS = (
+    "You are given three physiology items (RAH IDs) with their base profiles. "
+    "1) Propose a concise 'Combination' title (<=140 chars) that names the overlapping systems. "
+    "2) Provide a 1–2 sentence neutral 'Analysis' blurb describing likely shared dysfunction.\n"
+    "Return JSON only: {\"combination\":\"...\",\"analysis\":\"...\"}."
 )
 
-# ============================================================
-# Helpers
-# ============================================================
+POTENTIAL_Q_SYS = (
+    "From the three physiology base profiles, produce 8–12 crisp YES/NO items grouped across "
+    "Physical, Psychological/Emotional, and Functional. Return JSON only with this exact shape:\n"
+    "{\n"
+    "  \"Physical\": [\"...\", \"...\"],\n"
+    "  \"Psychological/Emotional\": [\"...\", \"...\"],\n"
+    "  \"Functional\": [\"...\", \"...\"]\n"
+    "}\n"
+    "Avoid duplication. Keep items short and specific."
+)
 
-def _normalize_triad(ids: List[float]) -> Tuple[float, float, float]:
-    return tuple(sorted(float(x) for x in ids))
+RECO_SYS = (
+    "Based on the three physiology base profiles, write a short 'Recommendations for Rebalancing' "
+    "section in a neutral, professional tone. Use 5–8 bullets covering diet, lifestyle, stress/"
+    "emotional regulation, and follow-up. Return plain text only."
+)
 
-def _combo_key(triad: Tuple[float, float, float]) -> str:
+# ----------------------- Small utils -----------------------
+def normalize_triad(ids: List[float]) -> Tuple[float, float, float]:
+    a = sorted(float(x) for x in ids)
+    return (a[0], a[1], a[2])
+
+def combo_key(triad: Tuple[float, float, float]) -> str:
     return ",".join(f"{x:.2f}" for x in triad)
 
-def _truncate(s: str, max_chars: int = 1200) -> str:
-    s = (s or "").strip()
-    return s if len(s) <= max_chars else s[: max_chars - 3] + "..."
+class RateLimiter:
+    def __init__(self, rps: float):
+        self.rps = max(0.1, float(rps))
+        self._lock = asyncio.Lock()
+        self._last = 0.0
 
-# ============================================================
-# Database helpers
-# ============================================================
+    async def acquire(self):
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            wait = max(0.0, (self._last + 1.0/self.rps) - now)
+            if wait:
+                await asyncio.sleep(wait)
+            self._last = loop.time()
 
-async def ensure_table_once(session: AsyncSession) -> None:
-    # Create table and the unique index in two separate statements (asyncpg limitation)
+# ----------------------- DB helpers -----------------------
+async def ensure_table_once(session: AsyncSession):
     await session.execute(sa_text("""
-                                  CREATE TABLE IF NOT EXISTS rah_schema.rah_combination_profiles (
-                                                                                                     combination_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                                  CREATE TABLE IF NOT EXISTS rah_schema.rah_combination_profiles(
+                                                                                                    combination_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                                       rah_ids NUMERIC(5,2)[] NOT NULL,
                                       combination_title TEXT,
                                       analysis TEXT,
@@ -80,17 +83,15 @@ async def ensure_table_once(session: AsyncSession) -> None:
                                   """))
     await session.commit()
 
-async def fetch_all_program_codes(session: AsyncSession) -> List[float]:
+async def exists_by_key(session: AsyncSession, key: str) -> bool:
     r = await session.execute(sa_text("""
-                                      SELECT DISTINCT program_code
-                                      FROM rah_schema.rah_base_profiles
-                                      WHERE program_code IS NOT NULL
-                                      ORDER BY program_code
-                                      """))
-    return [float(row[0]) for row in r.fetchall()]
+                                      SELECT 1 FROM rah_schema.rah_combination_profiles
+                                      WHERE combo_key = :k LIMIT 1
+                                      """), {"k": key})
+    return r.first() is not None
 
 async def fetch_base_profile(session: AsyncSession, program_code: float) -> str:
-    # Prefer curated base profile; fall back to any mapped rah_item description/details
+    # curated profile first
     r = await session.execute(sa_text("""
                                       SELECT profile_text
                                       FROM rah_schema.rah_base_profiles
@@ -101,27 +102,32 @@ async def fetch_base_profile(session: AsyncSession, program_code: float) -> str:
     if txt and str(txt).strip():
         return str(txt).strip()
 
+    # fallback – any item mapped to that program_code
     r = await session.execute(sa_text("""
-                                      SELECT COALESCE(NULLIF(i.description, ''), i.details)
+                                      SELECT COALESCE(NULLIF(i.description,''), i.details) AS txt
                                       FROM rah_schema.rah_item i
                                                JOIN rah_schema.rah_item_program ip ON ip.rah_id = i.rah_id
                                       WHERE ip.program_code = :pc
                                       ORDER BY i.rah_id
                                           LIMIT 1
                                       """), {"pc": int(program_code)})
-    txt = r.scalar_one_or_none()
-    return (txt or "").strip()
+    return (r.scalar_one_or_none() or "").strip()
 
-async def exists_by_key(session: AsyncSession, key: str) -> bool:
+async def fetch_all_program_codes(session: AsyncSession) -> List[float]:
     r = await session.execute(sa_text("""
-                                      SELECT 1
-                                      FROM rah_schema.rah_combination_profiles
-                                      WHERE combo_key = :k
-                                          LIMIT 1
-                                      """), {"k": key})
-    return r.first() is not None
+                                      SELECT DISTINCT program_code
+                                      FROM rah_schema.rah_base_profiles
+                                      WHERE program_code IS NOT NULL
+                                      ORDER BY program_code
+                                      """))
+    return [float(x[0]) for x in r.fetchall()]
 
-async def upsert_combination(session: AsyncSession, triad: Tuple[float, float, float], payload: Dict[str, Any]) -> None:
+async def upsert_combination(session: AsyncSession,
+                             triad: Tuple[float,float,float],
+                             title: str,
+                             analysis: str,
+                             potential: Dict[str, List[str]],
+                             reco: str):
     await session.execute(sa_text("""
                                   INSERT INTO rah_schema.rah_combination_profiles
                                   (rah_ids, combination_title, analysis, potential_indications, recommendations)
@@ -134,275 +140,169 @@ async def upsert_combination(session: AsyncSession, triad: Tuple[float, float, f
                                                                      recommendations = EXCLUDED.recommendations
                                   """), {
                               "rah_ids": list(triad),
-                              "title": str(payload.get("combination", "")).strip() or "Combination",
-                              "analysis": str(payload.get("analysis", "")).strip(),
-                              "pi": json.dumps(payload.get("potential_indications", {
-                                  "Physical": [], "Psychological/Emotional": [], "Functional": []
-                              })),
-                              "reco": "\n".join(payload.get("recommendations", [])),
+                              "title": (title or "Combination").strip(),
+                              "analysis": (analysis or "").strip(),
+                              "pi": json.dumps(potential or {}),
+                              "reco": (reco or "").strip()
                           })
     await session.commit()
 
-# ============================================================
-# Rate limit / retry
-# ============================================================
-
-class RateLimiter:
-    def __init__(self, rps: float):
-        self.rps = max(0.1, float(rps))
-        self._lock = asyncio.Lock()
-        self._last = 0.0
-
-    async def acquire(self):
-        async with self._lock:
-            loop = asyncio.get_event_loop()
-            now = loop.time()
-            min_interval = 1.0 / self.rps
-            wait = max(0.0, (self._last + min_interval) - now)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._last = loop.time()
-
-async def call_ollama_with_retry(system: str, user: str, retries: int = 3) -> str:
-    for attempt in range(retries + 1):
+# ----------------------- LLM w/ retries -----------------------
+async def call_with_retry(system: str, user: str, retries: int = 4, base: float = 0.7) -> str:
+    for i in range(retries + 1):
         try:
             return await ollama_generate(user, system=system)
         except Exception:
-            if attempt == retries:
+            if i == retries:
                 raise
-            # jittered backoff
-            await asyncio.sleep(0.8 * (2 ** attempt) * (0.7 + random.random() * 0.6))
+            jitter = base * (2 ** i) * (0.7 + random.random()*0.6)
+            await asyncio.sleep(jitter)
 
-# ============================================================
-# Payload validation
-# ============================================================
+def potential_empty_or_bad(p: Dict[str, List[str]]) -> bool:
+    return not any((p or {}).get(k) for k in ("Physical", "Psychological/Emotional", "Functional"))
 
-def _validate_payload(raw: str) -> Dict[str, Any]:
-    try:
-        data = json.loads(raw)
-    except Exception:
-        start, end = raw.find("{"), raw.rfind("}")
-        if 0 <= start < end:
-            data = json.loads(raw[start:end+1])
-        else:
-            return {
-                "combination": "Combination",
-                "analysis": raw.strip()[:400],
-                "potential_indications": {
-                    "Physical": [], "Psychological/Emotional": [], "Functional": []
-                },
-                "recommendations": []
-            }
+def title_bad(t: str) -> bool:
+    t = (t or "").strip().lower()
+    return (not t) or (t == "combination")
 
-    combo = str(data.get("combination", "")).strip() or "Combination"
-    analysis = str(data.get("analysis", "")).strip()
-    pi = data.get("potential_indications") or {}
-    phys = list(pi.get("Physical", [])) if isinstance(pi, dict) else []
-    psyc = list(pi.get("Psychological/Emotional", [])) if isinstance(pi, dict) else []
-    func = list(pi.get("Functional", [])) if isinstance(pi, dict) else []
-    rec = data.get("recommendations") or []
-    if isinstance(rec, str):
-        rec = [x.strip("-• ") for x in rec.splitlines() if x.strip()]
-    return {
-        "combination": combo,
-        "analysis": analysis,
-        "potential_indications": {
-            "Physical": phys, "Psychological/Emotional": psyc, "Functional": func
-        },
-        "recommendations": rec[:12]
-    }
-
-# ============================================================
-# Progress tracking
-# ============================================================
-
-class Progress:
-    def __init__(self, total: int):
-        self.total = total
-        self.done = 0
-        self.bad = 0
-        self.failed = 0
-        self.start = time.time()
-        self._lock = asyncio.Lock()
-        self._last_print = 0.0
-
-    async def tick(self, *, bad: bool = False, failed: bool = False):
-        async with self._lock:
-            self.done += 1
-            if bad:
-                self.bad += 1
-            if failed:
-                self.failed += 1
-            now = time.time()
-            if now - self._last_print >= 5:  # print every ~5s
-                self._last_print = now
-                rate = self.done / max(1e-9, (now - self.start))
-                remaining = max(0, self.total - self.done)
-                eta_s = remaining / max(1e-9, rate)
-                eta_min = int(eta_s // 60)
-                eta_sec = int(eta_s % 60)
-                print(f"[progress] {self.done}/{self.total} "
-                      f"({rate:.2f}/s, bad={self.bad}, failed={self.failed}) "
-                      f"ETA ~ {eta_min}m {eta_sec}s")
-
-    def final(self):
-        dur = time.time() - self.start
-        rate = self.done / max(1e-9, dur)
-        print(f"[done] {self.done}/{self.total} in {dur:.1f}s "
-              f"({rate:.2f}/s, bad={self.bad}, failed={self.failed})")
-
-# ============================================================
-# Generation logic (with --retry-bad)
-# ============================================================
-
-async def generate_for_triad(triad: Tuple[float, float, float],
+# ----------------------- One triad -----------------------
+async def generate_for_triad(triad: Tuple[float,float,float],
                              limiter: RateLimiter,
-                             dry_run: bool,
-                             retry_bad: bool,
-                             progress: Progress) -> None:
-    async with SessionLocal() as session:
-        key = _combo_key(triad)
-        if await exists_by_key(session, key):
-            await progress.tick()  # already exists counts as processed
+                             retry_bad: bool = False,
+                             dry_run: bool = False):
+    key = combo_key(triad)
+    async with SessionLocal() as s:
+        if await exists_by_key(s, key) and not dry_run:
             return
 
-        # Fetch base profiles
-        p1 = _truncate(await fetch_base_profile(session, triad[0]))
-        p2 = _truncate(await fetch_base_profile(session, triad[1]))
-        p3 = _truncate(await fetch_base_profile(session, triad[2]))
-
+        # fetch context
+        p1 = await fetch_base_profile(s, triad[0])
+        p2 = await fetch_base_profile(s, triad[1])
+        p3 = await fetch_base_profile(s, triad[2])
         context = (
-            f"Program A ({triad[0]:.2f}) base profile:\n{p1}\n\n"
-            f"Program B ({triad[1]:.2f}) base profile:\n{p2}\n\n"
-            f"Program C ({triad[2]:.2f}) base profile:\n{p3}\n\n"
-            "Return ONE JSON object now."
+            f"RAH {triad[0]:.2f} – Base Profile:\n{p1}\n\n"
+            f"RAH {triad[1]:.2f} – Base Profile:\n{p2}\n\n"
+            f"RAH {triad[2]:.2f} – Base Profile:\n{p3}\n"
         )
 
-        bad = False
+    # combo+analysis
+    await limiter.acquire()
+    raw = await call_with_retry(COMBO_TITLE_SYS, f"{context}\nReturn JSON now.")
+    title, analysis = "Combination", ""
+    try:
+        obj = json.loads(raw)
+        title = (obj.get("combination") or "Combination").strip()
+        analysis = (obj.get("analysis") or "").strip()
+    except Exception:
+        analysis = raw.strip()
+
+    # potential
+    await limiter.acquire()
+    praw = await call_with_retry(POTENTIAL_Q_SYS, f"{context}\nReturn JSON now.")
+    potential = {"Physical": [], "Psychological/Emotional": [], "Functional": []}
+    try:
+        pobj = json.loads(praw) or {}
+        potential["Physical"] = list(pobj.get("Physical", []))
+        potential["Psychological/Emotional"] = list(pobj.get("Psychological/Emotional", []))
+        potential["Functional"] = list(pobj.get("Functional", []))
+    except Exception:
+        pass
+
+    # optional retry on “bad”
+    if retry_bad and (title_bad(title) or potential_empty_or_bad(potential)):
+        await limiter.acquire()
+        raw = await call_with_retry(COMBO_TITLE_SYS, f"{context}\nReturn JSON now.")
         try:
-            await limiter.acquire()
-            raw = await call_ollama_with_retry(ONE_CALL_SYS, context)
-            payload = _validate_payload(raw)
+            obj = json.loads(raw)
+            if title_bad(title):
+                title = (obj.get("combination") or "Combination").strip()
+            if not analysis:
+                analysis = (obj.get("analysis") or "").strip()
+        except Exception:
+            pass
 
-            # Retry once if bland “Combination” title
-            if retry_bad and payload["combination"].lower() == "combination":
-                bad = True
-                await asyncio.sleep(1.0)
-                raw = await call_ollama_with_retry(ONE_CALL_SYS, context)
-                payload = _validate_payload(raw)
-
-            if dry_run:
-                print(f"[dry] {key} -> {payload['combination']!r}")
-            else:
-                await upsert_combination(session, triad, payload)
-
-            await progress.tick(bad=bad)
-        except Exception as e:
-            print(f"[error] {key}: {e}")
-            await progress.tick(failed=True)
-
-# ============================================================
-# Concurrency orchestration
-# ============================================================
-
-async def _producer(q: asyncio.Queue, codes: List[float], limit: Optional[int]) -> int:
-    count = 0
-    for a, b, c in itertools.combinations(codes, 3):
-        triad = _normalize_triad([a, b, c])
-        await q.put(triad)
-        count += 1
-        if limit and count >= limit:
-            break
-    workers = int(os.environ.get("GEN_WORKERS_COUNT", "4"))
-    for _ in range(workers):
-        await q.put(None)  # poison pill
-    return count
-
-async def _worker(idx: int,
-                  q: asyncio.Queue,
-                  limiter: RateLimiter,
-                  dry_run: bool,
-                  retry_bad: bool,
-                  progress: Progress):
-    while True:
-        triad = await q.get()
-        if triad is None:
-            q.task_done()
-            break
+        await limiter.acquire()
+        praw = await call_with_retry(POTENTIAL_Q_SYS, f"{context}\nReturn JSON now.")
         try:
-            await generate_for_triad(triad, limiter, dry_run, retry_bad, progress)
-        finally:
-            q.task_done()
+            pobj = json.loads(praw) or {}
+            if potential_empty_or_bad(potential):
+                potential["Physical"] = list(pobj.get("Physical", []))
+                potential["Psychological/Emotional"] = list(pobj.get("Psychological/Emotional", []))
+                potential["Functional"] = list(pobj.get("Functional", []))
+        except Exception:
+            pass
 
-# ============================================================
-# Run modes
-# ============================================================
+    # recommendations
+    await limiter.acquire()
+    reco = await call_with_retry(RECO_SYS, f"{context}\nReturn text only.")
 
-async def run_ids(ids: str, dry_run: bool, retry_bad: bool) -> None:
-    triad = _normalize_triad([float(x) for x in ids.split(",")])
-    limiter = RateLimiter(2.0)
-    progress = Progress(total=1)
-    await generate_for_triad(triad, limiter, dry_run, retry_bad, progress)
-    progress.final()
+    if dry_run:
+        print(f"[dry] {key} -> {title!r}")
+        return
 
-async def run_all(workers: int, rps: float, limit: Optional[int], dry_run: bool, retry_bad: bool):
-    # Prepare table and fetch codes
+    async with SessionLocal() as s:
+        await upsert_combination(s, triad, title, analysis, potential, reco)
+
+# ----------------------- Orchestration -----------------------
+async def run_ids(ids_str: str, dry_run: bool, retry_bad: bool):
+    triad = normalize_triad([float(x) for x in ids_str.split(",")])
+    limiter = RateLimiter(rps=2.0)
+    await generate_for_triad(triad, limiter, retry_bad=retry_bad, dry_run=dry_run)
+
+async def run_all(workers: int, rps: float, limit: Optional[int], retry_bad: bool, dry_run: bool):
     async with SessionLocal() as s:
         await ensure_table_once(s)
         codes = await fetch_all_program_codes(s)
 
-    # Compute total triads (with optional limit)
-    from math import comb
-    total_triads = comb(len(codes), 3)
-    if limit:
-        total_triads = min(total_triads, limit)
-
     os.environ["GEN_WORKERS_COUNT"] = str(workers)
     q: asyncio.Queue = asyncio.Queue(maxsize=workers * 4)
-    limiter = RateLimiter(rps)
-    progress = Progress(total=total_triads)
+    limiter = RateLimiter(rps=rps)
 
-    prod_task = asyncio.create_task(_producer(q, codes, limit))
-    workers_tasks = [asyncio.create_task(_worker(i + 1, q, limiter, dry_run, retry_bad, progress))
-                     for i in range(workers)]
-
-    # Graceful Ctrl+C
-    stop = asyncio.Event()
-    def _cancel(*_): stop.set()
-    try:
-        for sig in (signal.SIGINT, signal.SIGTERM):
+    async def producer():
+        n = 0
+        for a,b,c in itertools.combinations(codes, 3):
+            await q.put(normalize_triad([a,b,c]))
+            n += 1
+            if limit and n >= limit:
+                break
+        for _ in range(workers):
+            await q.put(None)  # poison
+    async def worker(idx: int):
+        processed = 0
+        while True:
+            triad = await q.get()
+            if triad is None:
+                break
             try:
-                asyncio.get_running_loop().add_signal_handler(sig, _cancel)
-            except NotImplementedError:
-                pass
-    except RuntimeError:
-        pass
+                await generate_for_triad(triad, limiter, retry_bad=retry_bad, dry_run=dry_run)
+            except Exception as e:
+                print(f"[worker {idx}] {combo_key(triad)} failed: {e}")
+            finally:
+                processed += 1
+                if processed % 50 == 0:
+                    print(f"[worker {idx}] processed {processed}")
+                q.task_done()
 
-    # Wait for all tasks
-    await asyncio.wait([prod_task, *workers_tasks], return_when=asyncio.ALL_COMPLETED)
-    progress.final()
-
-# ============================================================
-# CLI
-# ============================================================
+    prod = asyncio.create_task(producer())
+    workers_tasks = [asyncio.create_task(worker(i+1)) for i in range(workers)]
+    await asyncio.gather(prod, *workers_tasks)
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate RAH triad combination profiles (single-call, retryable) with progress.")
+    ap = argparse.ArgumentParser(description="Generate triad combination profiles into rah_combination_profiles.")
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--ids", help="Three comma-separated RAH codes, e.g. 30,50,76")
-    g.add_argument("--all3", action="store_true", help="Enumerate all 3-combinations from rah_base_profiles.program_code")
-
-    ap.add_argument("--workers", type=int, default=4, help="Concurrent workers (default 4)")
-    ap.add_argument("--rps", type=float, default=2.0, help="Global calls/sec across all workers")
-    ap.add_argument("--limit", type=int, help="Max triads to process")
-    ap.add_argument("--dry-run", action="store_true", help="Print only, no DB writes")
-    ap.add_argument("--retry-bad", action="store_true", help="Retry once if LLM returns generic 'Combination' title")
-
+    g.add_argument("--ids", help="Three comma-separated codes e.g. 30,50,76")
+    g.add_argument("--all3", action="store_true", help="Enumerate across rah_base_profiles.program_code")
+    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--rps", type=float, default=2.0)
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--retry-bad", action="store_true", help="Retry once if title is 'Combination' or potential is empty")
     args = ap.parse_args()
+
     if args.ids:
-        asyncio.run(run_ids(args.ids, args.dry_run, args.retry_bad))
-    elif args.all3:
-        asyncio.run(run_all(args.workers, args.rps, args.limit, args.dry_run, args.retry_bad))
+        asyncio.run(run_ids(args.ids, dry_run=args.dry_run, retry_bad=args.retry_bad))
+    else:
+        asyncio.run(run_all(args.workers, args.rps, args.limit, args.retry_bad, args.dry_run))
 
 if __name__ == "__main__":
     main()
