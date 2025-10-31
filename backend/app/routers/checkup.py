@@ -246,9 +246,9 @@ async def save_answers(payload: AnswersIn, session: AsyncSession = Depends(get_s
 async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_session)):
     await _ensure_table_runtime(session)
     res = await session.execute(sa_text("""
-                                        SELECT case_id::text, rah_ids, combination, analysis_blurb, questions, answers, notes, recommendations
+                                        SELECT case_id::text, rah_ids, combination, analysis_blurb, questions, answers, notes
                                         FROM rah_schema.checkup_case
-                                        WHERE case_id = :cid
+                                        WHERE case_id::text = :cid
                                         """), {"cid": payload.case_id})
     row = res.first()
     if not row:

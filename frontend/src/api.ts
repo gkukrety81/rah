@@ -7,6 +7,9 @@ export function authHeaders() {
     const t = localStorage.getItem("token");
     return t ? { Authorization: `Bearer ${t}` } : {};
 }
+export async function getCheckupCase(caseId: string) {
+    return fetchJson(`/checkup/${caseId}`);
+}
 
 async function fetchJson(input: RequestInfo, init?: RequestInit) {
     const r = await fetch(input, init);
@@ -113,6 +116,26 @@ export async function listCheckups(limit = 25, offset = 0) {
     return fetchJson(`${API}/checkup?limit=${limit}&offset=${offset}`, {
         headers: { ...authHeaders() },
     });
+}
+
+// add this helper to wrap analyze with a 404-repair
+export async function analyzeCheckupWithRepair(
+    caseId: string,
+    rahIds: number[],
+    ensureStarted: () => Promise<string> // callback that (re)starts and returns fresh case_id
+) {
+    try {
+        return await analyzeCheckup(caseId);
+    } catch (e: any) {
+        // If backend says the case doesn't exist, (re)start and retry once
+        const msg = (e?.message || "").toLowerCase();
+        const body = (e?.bodyText || "");
+        if (msg.includes("404") || body.includes("Unknown case_id")) {
+            const newCaseId = await ensureStarted();
+            return await analyzeCheckup(newCaseId);
+        }
+        throw e;
+    }
 }
 
 // Translate Stage 4/5 markdown (e.g., to German)

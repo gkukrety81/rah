@@ -7,6 +7,7 @@ import {
     listCases,
     translateMarkdown,
 } from "../api";
+import { analyzeCheckupWithRepair } from "../api";
 import jsPDF from "jspdf";
 import html2canvas from "html2canvas";
 
@@ -47,6 +48,7 @@ export default function Checkup() {
     const [histOpen, setHistOpen] = useState(false);
     const [history, setHistory] = useState<HistoryItem[]>([]);
     const resultsRef = useRef<HTMLDivElement | null>(null);
+    const ids = [parseFloat(rah1), parseFloat(rah2), parseFloat(rah3)];
 
     function resetAll() {
         setRah1("00.00"); setRah2("00.00"); setRah3("00.00");
@@ -56,20 +58,28 @@ export default function Checkup() {
         setResultMd(""); setTranslatedMd("");
     }
 
+    async function ensureStarted(): Promise<string> {
+        // Always (re)start to get a valid case_id; UI will still show DB/AI content already on screen
+        const res = await startCheckup(ids);
+        setCaseId(res.case_id);
+        // keep any combo/blurb/questions the API returns (no harm)
+        setCombo(res.combination_title || "");
+        setBlurb(res.analysis_blurb || "");
+        setQs(res.questions || []);
+        return res.case_id;
+    }
+
+
     async function onCheck() {
         setBusy(true);
         try {
-            const ids = [parseFloat(rah1), parseFloat(rah2), parseFloat(rah3)];
             const res = await startCheckup(ids);
             setCaseId(res.case_id);
             setCombo(res.combination_title || "");
             setBlurb(res.analysis_blurb || "");
-            setQs((res.questions || []) as Question[]);
+            setQs(res.questions || []);
             setSelected([]);
             setResultMd("");
-            setTranslatedMd("");
-            setReco(res.recommendations || "");
-            setSource(res.source || "");
             window.scrollTo({ top: 0, behavior: "smooth" });
         } catch (e) {
             console.error(e);
@@ -83,10 +93,28 @@ export default function Checkup() {
         if (!caseId) return;
         setBusy(true);
         try {
-            await saveCheckupAnswers(caseId, selected, notes);
-            const res = await analyzeCheckup(caseId);
+            // 1) Verify case exists; if 404, transparently re-start
+            let cid = caseId;
+            try {
+                await getCheckupCase(cid); // 200 = good
+            } catch {
+                // stale / missing row — re-start with the current 3 ids
+                const ids = [parseFloat(rah1), parseFloat(rah2), parseFloat(rah3)];
+                const fresh = await startCheckup(ids);
+                cid = fresh.case_id;
+
+                // refresh header from DB-start result so UI stays consistent
+                setCaseId(cid);
+                setCombo(fresh.combination_title || "");
+                setBlurb(fresh.analysis_blurb || "");
+                setQs(fresh.questions || []);
+                setSelected(prev => prev.filter(x => false)); // clear selections (or keep, your call)
+            }
+
+            // 2) Save + analyze
+            await saveCheckupAnswers(cid, selected, notes);
+            const res = await analyzeCheckup(cid);
             setResultMd(res.markdown || "");
-            setTranslatedMd("");
             setTimeout(() => {
                 document.getElementById("results")?.scrollIntoView({ behavior: "smooth" });
             }, 40);
