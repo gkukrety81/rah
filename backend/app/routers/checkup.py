@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
-import re, json
+import re
+import json
 
 from app.db import get_session, SessionLocal
 from app.ai import run_analysis_sections  # ensure this exists
@@ -18,6 +19,7 @@ router = APIRouter(prefix="/checkup", tags=["checkup"])
 def _clean_blurb(text: str) -> str:
     if not text:
         return ""
+    # Remove trailing JSON or debug artefact
     cleaned = re.sub(r"\n?\*\*?JSON\*\*?.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
     try:
         obj = json.loads(text)
@@ -82,17 +84,30 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
     comb = row.first()
 
     if comb:
+        # Build questions from potential_indications JSON
+        questions: List[Dict[str, Any]] = []
+        try:
+            pi = comb[4] or {}
+            for group in ("Physical", "Psychological/Emotional", "Functional"):
+                items = list(pi.get(group, []) or [])
+                for i, text_item in enumerate(items):
+                    qid = f"{group[:3].upper()}-{i+1}"
+                    questions.append({"id": qid, "text": text_item, "group": group})
+        except Exception:
+            questions = []
+
         ins = await session.execute(
             sa_text("""
                     INSERT INTO rah_schema.checkup_case
                     (rah_ids, combination, analysis_blurb, questions, recommendations, source)
-                    VALUES (:rah, :comb, :blurb, '[]'::jsonb, :reco, 'db')
+                    VALUES (:rah, :comb, :blurb, CAST(:qs AS jsonb), :reco, 'db')
                         RETURNING case_id::text
                     """),
             {
                 "rah": ids_sorted,
                 "comb": str(comb[2] or ""),
                 "blurb": _clean_blurb(str(comb[3] or "")),
+                "qs": json.dumps(questions),
                 "reco": str(comb[5] or ""),
             },
         )
@@ -104,12 +119,12 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
             rah_ids=ids_sorted,
             combination_title=str(comb[2] or ""),
             analysis_blurb=_clean_blurb(str(comb[3] or "")),
-            questions=[],  # can later populate from potential_indications
+            questions=questions,
             recommendations=str(comb[5] or ""),
             source="db",
         )
 
-    # fallback: AI
+    # fallback: AI path
     ins = await session.execute(
         sa_text("""
                 INSERT INTO rah_schema.checkup_case
@@ -121,8 +136,6 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
     )
     case_id = ins.scalar_one()
     await session.commit()
-
-
 
     return StartOut(
         case_id=case_id,
@@ -148,7 +161,8 @@ async def save_answers(payload: SaveAnswersIn):
         exists = await session.execute(
             sa_text("""
                     SELECT 1 FROM rah_schema.checkup_case
-                    WHERE case_id = :cid::uuid LIMIT 1
+                    WHERE case_id = :cid::uuid
+                LIMIT 1
                     """),
             {"cid": cid},
         )
@@ -160,9 +174,9 @@ async def save_answers(payload: SaveAnswersIn):
                     INSERT INTO rah_schema.checkup_answers (case_id, selected_ids, notes)
                     VALUES (:cid::uuid, :sel::text[], :notes)
                         ON CONFLICT (case_id)
-                DO UPDATE SET
+                  DO UPDATE SET
                         selected_ids = EXCLUDED.selected_ids,
-                                               notes = EXCLUDED.notes
+                                                 notes = EXCLUDED.notes
                     """),
             {"cid": cid, "sel": selected, "notes": notes},
         )
@@ -260,5 +274,18 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
 **Follow-Up**  
 {bullets(rec.get("follow_up", []))}
 """.strip()
+
+    # Persist result for history
+    await session.execute(
+        sa_text("""
+                INSERT INTO rah_schema.checkup_result (case_id, sections, markdown)
+                VALUES (:cid::uuid, CAST(:sec AS jsonb), :md)
+                    ON CONFLICT (case_id)
+              DO UPDATE SET sections = EXCLUDED.sections,
+                                         markdown = EXCLUDED.markdown
+                """),
+        {"cid": payload.case_id, "sec": json.dumps(sections), "md": md},
+    )
+    await session.commit()
 
     return AnalyzeOut(case_id=payload.case_id, sections=sections, markdown=md)
