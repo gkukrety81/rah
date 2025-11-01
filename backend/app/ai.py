@@ -16,3 +16,28 @@ async def generate(prompt: str) -> str:
         r.raise_for_status()
         j = r.json()
         return j.get("response", "")
+# --- Adapter for checkup.py ---
+async def run_analysis_sections(rah_ids, combination, analysis_blurb, selected_ids, notes, recommendations):
+    """
+    Adapter wrapper so checkup.py can call AI analysis uniformly.
+    Adjust this if you already have another core AI function.
+    """
+    # If your existing AI analysis is in another function (like run_analysis),
+    # just forward the arguments to it. For example:
+    #
+    # sections = await run_analysis(...)
+    #
+    # For now, return a minimal empty structure to unblock API startup:
+    return {
+        "correlated_systems": [],
+        "indications": [],
+        "note_synthesis": "",
+        "diagnostic_summary": "",
+        "recommendations": {
+            "lifestyle": [],
+            "nutritional": [],
+            "emotional": [],
+            "bioresonance": [],
+            "follow_up": [],
+        },
+    }
