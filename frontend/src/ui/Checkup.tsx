@@ -7,6 +7,7 @@ type StartResp = {
     ok: boolean;
     case_id: string;
     rah_ids: number[];
+    rah_labels: string[];              // NEW (from backend)
     combination_title: string;
     analysis_blurb: string;
     questions: Question[];
@@ -15,11 +16,19 @@ type StartResp = {
 };
 type AnalyzeResp = { case_id: string; sections: Record<string, any>; markdown: string };
 
+// 21 official codes (frontend validation to match backend)
+const ALLOWED = new Set([
+    30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 62, 64, 66, 68, 72, 75, 76,
+]);
+
 export default function Checkup() {
-    // Stage 1 inputs
+    // Stage 1 inputs (text so we can format on blur)
     const [rah1, setRah1] = useState("00.00");
     const [rah2, setRah2] = useState("00.00");
     const [rah3, setRah3] = useState("00.00");
+
+    // Hints for labels after /start (keeps input order)
+    const [rahLabels, setRahLabels] = useState<string[]>([]);
 
     // Flow state
     const [busy, setBusy] = useState(false);
@@ -50,16 +59,53 @@ export default function Checkup() {
     }, [qs]);
 
     function resetAll() {
-        setRah1("00.00"); setRah2("00.00"); setRah3("00.00");
-        setBusy(false); setCaseId(null); setSource("ai");
-        setCombo(""); setBlurb(""); setQs([]); setSelected([]); setReco("");
-        setNotes(""); setResultMd("");
+        setRah1("00.00");
+        setRah2("00.00");
+        setRah3("00.00");
+        setRahLabels([]);
+        setBusy(false);
+        setCaseId(null);
+        setSource("ai");
+        setCombo("");
+        setBlurb("");
+        setQs([]);
+        setSelected([]);
+        setReco("");
+        setNotes("");
+        setResultMd("");
+    }
+
+    function toFixed2(s: string) {
+        const n = Number(s);
+        return Number.isFinite(n) ? n.toFixed(2) : s;
+    }
+
+    function normalizeAll() {
+        setRah1((v) => toFixed2(v));
+        setRah2((v) => toFixed2(v));
+        setRah3((v) => toFixed2(v));
+    }
+
+    function validateAllowed(values: number[]) {
+        const bad = values.filter((v) => !ALLOWED.has(Number(v.toFixed(0))));
+        if (bad.length) {
+            alert(
+                `Only the 21 official physiologies are allowed.\nInvalid: ${bad
+                    .map((v) => v.toFixed(2))
+                    .join(", ")}\n\nAllowed: ${Array.from(ALLOWED).join(", ")}`
+            );
+            return false;
+        }
+        return true;
     }
 
     async function onCheck() {
+        normalizeAll();
         setBusy(true);
         try {
             const ids = [parseFloat(rah1), parseFloat(rah2), parseFloat(rah3)];
+            if (!validateAllowed(ids)) return;
+
             const res: StartResp = await startCheckup(ids);
             setCaseId(res.case_id);
             setSource(res.source);
@@ -69,6 +115,8 @@ export default function Checkup() {
             setReco(res.recommendations || "");
             setSelected([]);
             setResultMd("");
+            setRahLabels(res.rah_labels || []);
+
             // scroll to Stage 2
             setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 30);
         } catch (e) {
@@ -105,7 +153,7 @@ export default function Checkup() {
                         <div>
                             <div className="font-semibold text-lg">RAH check-up</div>
                             <div className="text-gray-500 text-sm">
-                                Enter three RAH IDs and click <span className="font-medium">Check</span> to generate questions.
+                                Enter three RAH IDs from the official list and click <span className="font-medium">Check</span>.
                             </div>
                         </div>
                     </div>
@@ -130,11 +178,24 @@ export default function Checkup() {
                 </div>
 
                 <div className="px-6 py-5 bg-slate-50/60">
-                    <div className="flex flex-wrap items-center gap-6">
-                        <RahInput label="RAH check-up 1" value={rah1} onChange={setRah1} />
-                        <RahInput label="RAH check-up 2" value={rah2} onChange={setRah2} />
-                        <RahInput label="RAH check-up 3" value={rah3} onChange={setRah3} />
+                    <div className="flex flex-wrap items-start gap-6">
+                        <RahInput label="RAH check-up 1" value={rah1} onChange={setRah1} hint={rahLabels[0]} />
+                        <RahInput label="RAH check-up 2" value={rah2} onChange={setRah2} hint={rahLabels[1]} />
+                        <RahInput label="RAH check-up 3" value={rah3} onChange={setRah3} hint={rahLabels[2]} />
                     </div>
+
+                    {/* Badge strip for visual confirmation */}
+                    {rahLabels.length > 0 && (
+                        <div className="mt-4 flex flex-wrap gap-2">
+                            {rahLabels.map((lbl, i) =>
+                                    lbl ? (
+                                        <span key={i} className="text-xs rounded-full border bg-white px-2 py-1">
+                    {i === 0 ? rah1 : i === 1 ? rah2 : rah3} — {lbl}
+                  </span>
+                                    ) : null
+                            )}
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -148,7 +209,9 @@ export default function Checkup() {
                         </div>
                         <span
                             className={`text-xs px-2 py-1 rounded ${
-                                source === "db" ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-amber-50 text-amber-700 border border-amber-200"
+                                source === "db"
+                                    ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                    : "bg-amber-50 text-amber-700 border border-amber-200"
                             }`}
                             title={source === "db" ? "Fetched from curated DB" : "AI path (no curated triad found yet)"}
                         >
@@ -174,22 +237,26 @@ export default function Checkup() {
                                     {(grouped[g] || []).length === 0 ? (
                                         <div className="text-sm text-gray-500">No items.</div>
                                     ) : (
-                                        grouped[g].map((q) => {
-                                            const checked = selected.includes(q.id);
-                                            return (
-                                                <label key={q.id} className="flex items-start gap-3 py-2">
-                                                    <input
-                                                        type="checkbox"
-                                                        className="mt-1 h-4 w-4"
-                                                        checked={checked}
-                                                        onChange={() =>
-                                                            setSelected((cur) => (checked ? cur.filter((x) => x !== q.id) : [...cur, q.id]))
-                                                        }
-                                                    />
-                                                    <span className="text-sm">{q.text}</span>
-                                                </label>
-                                            );
-                                        })
+                                        <ul className="list-disc pl-5 space-y-2">
+                                            {grouped[g].map((q) => {
+                                                const checked = selected.includes(q.id);
+                                                return (
+                                                    <li key={q.id}>
+                                                        <label className="flex items-start gap-3">
+                                                            <input
+                                                                type="checkbox"
+                                                                className="mt-1 h-4 w-4"
+                                                                checked={checked}
+                                                                onChange={() =>
+                                                                    setSelected((cur) => (checked ? cur.filter((x) => x !== q.id) : [...cur, q.id]))
+                                                                }
+                                                            />
+                                                            <span className="text-sm">{q.text}</span>
+                                                        </label>
+                                                    </li>
+                                                );
+                                            })}
+                                        </ul>
                                     )}
                                 </div>
                             </div>
@@ -234,19 +301,15 @@ export default function Checkup() {
                     <div className="px-6 py-5 border-b flex items-center justify-between">
                         <div>
                             <div className="text-lg font-semibold">RAI Analysis</div>
-                            <div className="text-sm text-gray-500">Case <code>{caseId}</code></div>
+                            <div className="text-sm text-gray-500">
+                                Case <code>{caseId}</code>
+                            </div>
                         </div>
                         <div className="flex gap-2">
-                            <button
-                                className="text-sm px-3 py-1.5 border rounded hover:bg-gray-50"
-                                onClick={() => downloadText("rai-analysis.md", resultMd)}
-                            >
+                            <button className="text-sm px-3 py-1.5 border rounded hover:bg-gray-50" onClick={() => downloadText("rai-analysis.md", resultMd)}>
                                 ⬇️ Download .md
                             </button>
-                            <button
-                                className="text-sm px-3 py-1.5 border rounded hover:bg-gray-50"
-                                onClick={() => copyText(resultMd)}
-                            >
+                            <button className="text-sm px-3 py-1.5 border rounded hover:bg-gray-50" onClick={() => copyText(resultMd)}>
                                 📋 Copy
                             </button>
                         </div>
@@ -260,17 +323,22 @@ export default function Checkup() {
     );
 }
 
-function RahInput(props: { label: string; value: string; onChange: (v: string) => void }) {
+function RahInput(props: { label: string; value: string; onChange: (v: string) => void; hint?: string }) {
     return (
-        <div className="flex items-center gap-3">
-            <div className="text-sm text-gray-600 w-36">{props.label}</div>
-            <input
-                value={props.value}
-                onChange={(e) => props.onChange(e.target.value)}
-                className="w-40 rounded-lg border px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-500"
-                placeholder="00.00"
-            />
-            <span className="text-gray-400">✎</span>
+        <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-3">
+                <div className="text-sm text-gray-600 w-36">{props.label}</div>
+                <input
+                    value={props.value}
+                    onChange={(e) => props.onChange(e.target.value)}
+                    onBlur={(e) => props.onChange(Number.isFinite(Number(e.target.value)) ? Number(e.target.value).toFixed(2) : e.target.value)}
+                    className="w-40 rounded-lg border px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-500"
+                    placeholder="00.00"
+                    inputMode="decimal"
+                />
+                <span className="text-gray-400">✎</span>
+            </div>
+            {props.hint && <div className="ml-36 text-xs text-gray-500">{props.hint}</div>}
         </div>
     );
 }
@@ -282,7 +350,11 @@ function Markdown({ md }: { md: string }) {
             {md.split("\n").map((line, i) => {
                 if (line.startsWith("# ")) return <h1 key={i}>{line.slice(2)}</h1>;
                 if (line.startsWith("## ")) return <h2 key={i}>{line.slice(3)}</h2>;
-                if (line.startsWith("- ")) return <li key={i}>{line.slice(2)}</li>;
+                if (line.startsWith("- ")) return (
+                    <ul key={i} className="list-disc pl-5">
+                        <li>{line.slice(2)}</li>
+                    </ul>
+                );
                 if (line.trim() === "") return <div key={i} className="h-2" />;
                 return <p key={i}>{line}</p>;
             })}

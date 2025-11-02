@@ -10,17 +10,15 @@ import re
 import json
 
 from app.db import get_session
-from app.ai import run_analysis_sections  # ensure this exists
+from app.ai import run_analysis_sections
 
 router = APIRouter(prefix="/checkup", tags=["checkup"])
-
 
 # ----------------------------- Helpers -----------------------------
 
 def _clean_blurb(text: str) -> str:
     if not text:
         return ""
-    # Remove trailing JSON or debug artefact
     cleaned = re.sub(r"\n?\*\*?JSON\*\*?.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
     try:
         obj = json.loads(text)
@@ -30,11 +28,36 @@ def _clean_blurb(text: str) -> str:
         pass
     return cleaned.strip()
 
-
 def _triad_key(ids: List[float]) -> str:
     s = [f"{float(x):.2f}" for x in sorted(float(v) for v in ids)]
     return ",".join(s)
 
+async def _fetch_labels(session: AsyncSession, ids_sorted: List[float]) -> Dict[float, str]:
+    """
+    Fetch human labels for the given program codes without assuming a specific column name.
+    We read the whole row as JSON and pick the first present key from a set of candidates.
+    """
+    res = await session.execute(
+        sa_text("""
+                SELECT program_code::numeric(5,2) AS code, to_jsonb(p) AS obj
+                FROM rah_schema.physiology_program p
+                WHERE program_code = ANY(:ids)
+                """),
+        {"ids": ids_sorted},
+    )
+    rows = res.fetchall()
+    labels: Dict[float, str] = {}
+    candidates = ("title", "name", "program", "description")
+    for code, obj in rows:
+        label = ""
+        if isinstance(obj, dict):
+            for k in candidates:
+                if k in obj and obj[k]:
+                    label = str(obj[k])
+                    break
+        # last resort: echo the code itself if nothing usable found
+        labels[float(code)] = label or f"{float(code):.2f}"
+    return labels
 
 # ----------------------------- Models -----------------------------
 
@@ -45,6 +68,7 @@ class StartOut(BaseModel):
     ok: bool = True
     case_id: str
     rah_ids: List[float]
+    rah_labels: List[str] = []
     combination_title: Optional[str] = ""
     analysis_blurb: Optional[str] = ""
     questions: List[Dict[str, Any]] = []
@@ -64,7 +88,6 @@ class AnalyzeOut(BaseModel):
     sections: Dict[str, Any]
     markdown: str
 
-
 # ----------------------------- Routes -----------------------------
 
 @router.post("/start", response_model=StartOut)
@@ -72,6 +95,16 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
     ids_sorted = sorted(float(x) for x in payload.rah_ids)
     key = _triad_key(ids_sorted)
 
+    # Validate the 3 codes and fetch human labels (robust to column names)
+    labels_map = await _fetch_labels(session, ids_sorted)
+    if len(labels_map) != 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid RAH IDs. Only the 21 official physiologies (30–76) are accepted."
+        )
+    rah_labels_in_input_order = [labels_map.get(float(x), "") for x in payload.rah_ids]
+
+    # Look up the triad combination
     row = await session.execute(
         sa_text("""
                 SELECT combination_id::text, rah_ids, combination_title, analysis,
@@ -118,6 +151,7 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
         return StartOut(
             case_id=case_id,
             rah_ids=ids_sorted,
+            rah_labels=rah_labels_in_input_order,
             combination_title=str(comb[2] or ""),
             analysis_blurb=_clean_blurb(str(comb[3] or "")),
             questions=questions,
@@ -125,7 +159,7 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
             source="db",
         )
 
-    # fallback: AI path
+    # AI fallback
     ins = await session.execute(
         sa_text("""
                 INSERT INTO rah_schema.checkup_case
@@ -141,6 +175,7 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
     return StartOut(
         case_id=case_id,
         rah_ids=ids_sorted,
+        rah_labels=rah_labels_in_input_order,
         combination_title="",
         analysis_blurb="",
         questions=[],
@@ -148,12 +183,9 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
         source="ai",
     )
 
-
 @router.post("/answers")
 async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(get_session)):
-    """
-    Store practitioner selections/notes. Use CAST(:param AS type) to avoid asyncpg '::' issues.
-    """
+    """Store practitioner selections/notes."""
     cid = (payload.case_id or "").strip()
     if not cid:
         raise HTTPException(status_code=400, detail="case_id required")
@@ -186,7 +218,6 @@ async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(g
     )
     await session.commit()
     return {"ok": True}
-
 
 @router.post("/analyze", response_model=AnalyzeOut)
 async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_session)):
@@ -278,7 +309,6 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
 {bullets(rec.get("follow_up", []))}
 """.strip()
 
-    # Persist result for history
     await session.execute(
         sa_text("""
                 INSERT INTO rah_schema.checkup_result (case_id, sections, markdown)
