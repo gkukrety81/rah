@@ -1,3 +1,4 @@
+# backend/app/routers/checkup.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import re
 import json
 
-from app.db import get_session, SessionLocal
+from app.db import get_session
 from app.ai import run_analysis_sections  # ensure this exists
 
 router = APIRouter(prefix="/checkup", tags=["checkup"])
@@ -149,7 +150,10 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
 
 
 @router.post("/answers")
-async def save_answers(payload: SaveAnswersIn):
+async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(get_session)):
+    """
+    Store practitioner selections/notes. Use CAST(:param AS type) to avoid asyncpg '::' issues.
+    """
     cid = (payload.case_id or "").strip()
     if not cid:
         raise HTTPException(status_code=400, detail="case_id required")
@@ -157,31 +161,30 @@ async def save_answers(payload: SaveAnswersIn):
     selected = payload.selected or []
     notes = (payload.notes or "").strip()
 
-    async with SessionLocal() as session:
-        exists = await session.execute(
-            sa_text("""
-                    SELECT 1 FROM rah_schema.checkup_case
-                    WHERE case_id = :cid::uuid
-                LIMIT 1
-                    """),
-            {"cid": cid},
-        )
-        if exists.first() is None:
-            raise HTTPException(status_code=404, detail="Unknown case_id")
+    exists = await session.execute(
+        sa_text("""
+                SELECT 1 FROM rah_schema.checkup_case
+                WHERE case_id = CAST(:cid AS uuid)
+                    LIMIT 1
+                """),
+        {"cid": cid},
+    )
+    if exists.first() is None:
+        raise HTTPException(status_code=404, detail="Unknown case_id")
 
-        await session.execute(
-            sa_text("""
-                    INSERT INTO rah_schema.checkup_answers (case_id, selected_ids, notes)
-                    VALUES (:cid::uuid, :sel::text[], :notes)
-                        ON CONFLICT (case_id)
-                  DO UPDATE SET
-                        selected_ids = EXCLUDED.selected_ids,
-                                                 notes = EXCLUDED.notes
-                    """),
-            {"cid": cid, "sel": selected, "notes": notes},
-        )
-        await session.commit()
-
+    await session.execute(
+        sa_text("""
+                INSERT INTO rah_schema.checkup_answers (case_id, selected_ids, notes)
+                VALUES (CAST(:cid AS uuid), CAST(:sel AS text[]), :notes)
+                    ON CONFLICT (case_id)
+            DO UPDATE SET
+                    selected_ids = EXCLUDED.selected_ids,
+                                       notes        = EXCLUDED.notes,
+                                       updated_at   = now()
+                """),
+        {"cid": cid, "sel": selected, "notes": notes},
+    )
+    await session.commit()
     return {"ok": True}
 
 
@@ -190,12 +193,12 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
     case_q = await session.execute(
         sa_text("""
                 SELECT case_id::text, rah_ids,
-                       COALESCE(combination, '') AS combination,
-                       COALESCE(analysis_blurb, '') AS analysis_blurb,
-                       COALESCE(recommendations, '') AS recommendations
+                       COALESCE(combination, '')      AS combination,
+                       COALESCE(analysis_blurb, '')   AS analysis_blurb,
+                       COALESCE(recommendations, '')  AS recommendations
                 FROM rah_schema.checkup_case
-                WHERE case_id::text = :cid
-            LIMIT 1
+                WHERE case_id = CAST(:cid AS uuid)
+                    LIMIT 1
                 """),
         {"cid": payload.case_id},
     )
@@ -206,10 +209,10 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
     ans_q = await session.execute(
         sa_text("""
                 SELECT COALESCE(selected_ids, ARRAY[]::text[]) AS selected_ids,
-                       COALESCE(notes, '') AS notes
+                       COALESCE(notes, '')                    AS notes
                 FROM rah_schema.checkup_answers
-                WHERE case_id::text = :cid
-            LIMIT 1
+                WHERE case_id = CAST(:cid AS uuid)
+                    LIMIT 1
                 """),
         {"cid": payload.case_id},
     )
@@ -279,10 +282,11 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
     await session.execute(
         sa_text("""
                 INSERT INTO rah_schema.checkup_result (case_id, sections, markdown)
-                VALUES (:cid::uuid, CAST(:sec AS jsonb), :md)
+                VALUES (CAST(:cid AS uuid), CAST(:sec AS jsonb), :md)
                     ON CONFLICT (case_id)
-              DO UPDATE SET sections = EXCLUDED.sections,
-                                         markdown = EXCLUDED.markdown
+            DO UPDATE SET
+                    sections = EXCLUDED.sections,
+                                       markdown = EXCLUDED.markdown
                 """),
         {"cid": payload.case_id, "sec": json.dumps(sections), "md": md},
     )

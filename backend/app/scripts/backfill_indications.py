@@ -1,7 +1,11 @@
 # backend/app/scripts/backfill_indications.py
 from __future__ import annotations
-import argparse, asyncio, json, os, random, itertools
-from typing import Dict, List, Tuple
+import argparse
+import asyncio
+import json
+import os
+import random
+from typing import Optional, List, Tuple
 
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,126 +14,173 @@ from app.db import SessionLocal
 from app.ollama_client import ollama_generate
 
 POTENTIAL_Q_SYS = (
-    "From the three physiology base profiles, produce 8–12 crisp YES/NO items grouped across "
-    "Physical, Psychological/Emotional, and Functional. Return JSON only with this exact shape:\n"
+    "From the combination title and analysis, produce 8–12 crisp YES/NO screening items grouped across "
+    "Physical, Psychological/Emotional, and Functional. Return STRICT JSON with this exact shape:\n"
     "{\n"
-    "  \"Physical\": [\"...\", \"...\"],\n"
-    "  \"Psychological/Emotional\": [\"...\", \"...\"],\n"
-    "  \"Functional\": [\"...\", \"...\"]\n"
+    '  "Physical": ["..."],\n'
+    '  "Psychological/Emotional": ["..."],\n'
+    '  "Functional": ["..."]\n'
     "}\n"
-    "Avoid duplication. Keep items short and specific."
+    "Keep each item short, specific, and clinically neutral. No extra text, no markdown, only JSON."
 )
 
-async def fetch_base_profile(session: AsyncSession, program_code: float) -> str:
-    r = await session.execute(sa_text("""
-                                      SELECT profile_text
-                                      FROM rah_schema.rah_base_profiles
-                                      WHERE program_code = :pc LIMIT 1
-                                      """), {"pc": int(program_code)})
-    txt = r.scalar_one_or_none()
-    if txt and str(txt).strip():
-        return str(txt).strip()
+class RateLimiter:
+    def __init__(self, rps: float):
+        self.rps = max(0.1, float(rps))
+        self._lock = asyncio.Lock()
+        self._last = 0.0
 
-    r = await session.execute(sa_text("""
-                                      SELECT COALESCE(NULLIF(i.description,''), i.details) AS txt
-                                      FROM rah_schema.rah_item i
-                                               JOIN rah_schema.rah_item_program ip ON ip.rah_id = i.rah_id
-                                      WHERE ip.program_code = :pc
-                                      ORDER BY i.rah_id LIMIT 1
-                                      """), {"pc": int(program_code)})
-    return (r.scalar_one_or_none() or "").strip()
+    async def acquire(self):
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            min_interval = 1.0 / self.rps
+            wait = max(0.0, (self._last + min_interval) - now)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last = loop.time()
 
-def normalize_potential(raw: Dict) -> Dict[str, List[str]]:
-    out = {
-        "Physical": [],
-        "Psychological/Emotional": [],
-        "Functional": []
-    }
-    try:
-        for k in out.keys():
-            vals = raw.get(k, []) or []
-            seen = set()
-            clean = []
-            for v in vals:
-                s = " ".join(str(v).strip().split())
-                if s and s.lower() not in seen:
-                    seen.add(s.lower())
-                    clean.append(s)
-            out[k] = clean[:12]
-    except Exception:
-        pass
-    return out
+async def fetch_batch(session: AsyncSession, only_missing: bool, limit: Optional[int]) -> List[Tuple[str, str, str]]:
+    """
+    Returns list of (combination_id, combination_title, analysis) to fill.
+    """
+    if only_missing:
+        sql = """
+              SELECT combination_id::text, COALESCE(combination_title,''), COALESCE(analysis,'')
+              FROM rah_schema.rah_combination_profiles
+              WHERE potential_indications IS NULL
+                 OR potential_indications = '{}'::jsonb
+              ORDER BY created_at ASC
+                  LIMIT :lim
+              """
+    else:
+        sql = """
+              SELECT combination_id::text, COALESCE(combination_title,''), COALESCE(analysis,'')
+              FROM rah_schema.rah_combination_profiles
+              ORDER BY created_at ASC
+                  LIMIT :lim
+              """
+    r = await session.execute(sa_text(sql), {"lim": limit or 500})
+    return [(row[0], row[1], row[2]) for row in r.fetchall()]
 
-async def process_row(session: AsyncSession, comb_id: str, rah_ids: List[float]) -> bool:
-    # Build context from base profiles
-    p = []
-    for code in rah_ids:
-        p.append(await fetch_base_profile(session, float(code)))
-
-    context = (
-        f"RAH {rah_ids[0]:.2f} – Base Profile:\n{p[0] or '(no base profile)'}\n\n"
-        f"RAH {rah_ids[1]:.2f} – Base Profile:\n{p[1] or '(no base profile)'}\n\n"
-        f"RAH {rah_ids[2]:.2f} – Base Profile:\n{p[2] or '(no base profile)'}\n"
-    )
-
-    # Ask LLM
-    raw = await ollama_generate(prompt=f"{context}\nReturn JSON now.", system=POTENTIAL_Q_SYS)
+def parse_potential(raw: str) -> Optional[dict]:
     try:
         obj = json.loads(raw)
+        phys = list(obj.get("Physical", []))
+        psych = list(obj.get("Psychological/Emotional", []))
+        func = list(obj.get("Functional", []))
+        if not isinstance(phys, list) or not isinstance(psych, list) or not isinstance(func, list):
+            return None
+        return {
+            "Physical": [str(x) for x in phys][:12],
+            "Psychological/Emotional": [str(x) for x in psych][:12],
+            "Functional": [str(x) for x in func][:12],
+        }
     except Exception:
-        obj = {}
-    normalized = normalize_potential(obj)
+        return None
 
-    # Save
-    await session.execute(sa_text("""
-                                  UPDATE rah_schema.rah_combination_profiles
-                                  SET potential_indications = CAST(:pi AS jsonb)
-                                  WHERE combination_id = :id::uuid
-                                  """), {"pi": json.dumps(normalized), "id": comb_id})
-    return True
+async def call_ollama_with_retry(system_prompt: str, user_prompt: str, retries=3, base=0.8) -> str:
+    for attempt in range(retries + 1):
+        try:
+            return await ollama_generate(user_prompt, system=system_prompt)
+        except Exception:
+            if attempt == retries:
+                raise
+            # jittered backoff
+            delay = base * (2 ** attempt) * (0.7 + random.random() * 0.6)
+            await asyncio.sleep(delay)
 
-async def run(limit: int | None, only_missing: bool, rps: float):
-    # crude global rate limiter
-    min_interval = max(0.2, 1.0 / float(rps))
+async def update_row(session: AsyncSession, cid: str, potential: dict) -> None:
+    await session.execute(
+        sa_text("""
+                UPDATE rah_schema.rah_combination_profiles
+                SET potential_indications = CAST(:pi AS jsonb)
+                WHERE combination_id = :cid::uuid
+                """),
+        {"pi": json.dumps(potential, ensure_ascii=False), "cid": cid},
+    )
+    await session.commit()
 
-    async with SessionLocal() as session:
-        q = """
-            SELECT combination_id::text, rah_ids
-            FROM rah_schema.rah_combination_profiles \
-            """
-        if only_missing:
-            q += " WHERE potential_indications IS NULL"
-        q += " ORDER BY created_at DESC"
+async def worker(name: int,
+                 q: asyncio.Queue,
+                 limiter: RateLimiter,
+                 retry_bad: bool,
+                 counters: dict):
+    while True:
+        item = await q.get()
+        if item is None:
+            q.task_done()
+            break
+        cid, title, analysis = item
+        try:
+            await limiter.acquire()
+            prompt = f"Combination: {title}\nAnalysis: {analysis}\n\nReturn JSON now."
+            raw = await call_ollama_with_retry(POTENTIAL_Q_SYS, prompt)
+            parsed = parse_potential(raw)
 
-        rows = await session.execute(sa_text(q))
-        items = rows.fetchall()
+            if not parsed and retry_bad:
+                # do one more try with tightened instruction
+                await limiter.acquire()
+                raw2 = await call_ollama_with_retry(
+                    POTENTIAL_Q_SYS + "\nIf you failed before, ensure you output ONLY valid JSON.",
+                    prompt
+                )
+                parsed = parse_potential(raw2)
 
-        processed = 0
-        for row in items:
-            if limit and processed >= limit: break
-            comb_id, rah_ids = row[0], list(row[1])
-            try:
-                ok = await process_row(session, comb_id, rah_ids)
-                if ok:
-                    await session.commit()
-                    processed += 1
-                    if processed % 10 == 0:
-                        print(f"[backfill] processed {processed}")
-            except Exception as e:
-                await session.rollback()
-                print(f"[backfill] {comb_id} failed: {e}")
-            finally:
-                await asyncio.sleep(min_interval)
+            if parsed:
+                async with SessionLocal() as s:
+                    await update_row(s, cid, parsed)
+                counters["updated"] += 1
+            else:
+                counters["bad"] += 1
+        except Exception as e:
+            counters["failed"] += 1
+            print(f"[worker {name}] {cid} error: {e}")
+        finally:
+            q.task_done()
+            total = counters["done"] = counters.get("done", 0) + 1
+            if total % 25 == 0:
+                print(f"[progress] {total} (updated={counters['updated']}, bad={counters['bad']}, failed={counters['failed']})")
 
-        print(f"[backfill] done: {processed}")
+async def main_async(only_missing: bool, limit: Optional[int], workers: int, rps: float, retry_bad: bool):
+    # gather work
+    async with SessionLocal() as s:
+        batch = await fetch_batch(s, only_missing=only_missing, limit=limit)
+
+    if not batch:
+        print("[backfill] nothing to do")
+        return
+
+    q: asyncio.Queue = asyncio.Queue(maxsize=workers * 4)
+    limiter = RateLimiter(rps=rps)
+    counters = {"updated": 0, "bad": 0, "failed": 0, "done": 0}
+
+    # enqueue
+    for row in batch:
+        await q.put(row)
+    for _ in range(workers):
+        await q.put(None)
+
+    tasks = [asyncio.create_task(worker(i + 1, q, limiter, retry_bad, counters)) for i in range(workers)]
+    await asyncio.gather(*tasks)
+    print(f"[done] updated={counters['updated']} bad={counters['bad']} failed={counters['failed']}")
 
 def main():
-    ap = argparse.ArgumentParser(description="Backfill potential_indications on combination rows.")
-    ap.add_argument("--limit", type=int, help="Max rows", default=None)
-    ap.add_argument("--rps", type=float, default=1.0, help="LLM calls per second")
-    ap.add_argument("--only-missing", action="store_true", help="Only rows with NULL potential_indications")
+    ap = argparse.ArgumentParser(description="Backfill potential_indications for existing triads")
+    ap.add_argument("--only-missing", action="store_true", help="Fill rows where potential_indications is NULL or {}")
+    ap.add_argument("--limit", type=int, help="Max rows to process (default 500)")
+    ap.add_argument("--workers", type=int, default=6, help="Concurrent workers (default 6)")
+    ap.add_argument("--rps", type=float, default=2.0, help="Global LLM calls per second (default 2.0)")
+    ap.add_argument("--retry-bad", action="store_true", help="Retry once if JSON parsing fails")
     args = ap.parse_args()
-    asyncio.run(run(args.limit, args.only_missing, args.rps))
+
+    asyncio.run(main_async(
+        only_missing=args.only_missing,
+        limit=args.limit,
+        workers=args.workers,
+        rps=args.rps,
+        retry_bad=args.retry_bad
+    ))
 
 if __name__ == "__main__":
     main()

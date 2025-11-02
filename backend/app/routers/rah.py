@@ -23,6 +23,16 @@ async def get_description(rah_id: float, session: AsyncSession = Depends(get_ses
         "description": (description or "").strip()
     }
 
+@router.get("/catalog")
+async def get_catalog(session: AsyncSession = Depends(get_session)):
+    res = await session.execute(sa_text("""
+                                        SELECT rah_code::text, label, COALESCE(category,'') AS category, COALESCE(sort_order, 999) AS sort_order
+                                        FROM rah_schema.rah_catalog
+                                        ORDER BY sort_order, rah_code
+                                        """))
+    rows = [{"code": r[0], "label": r[1], "category": r[2]} for r in res.fetchall()]
+    return {"items": rows}
+
 @router.get("")
 async def list_rah(
         page: int = Query(1, ge=1),
