@@ -14,6 +14,7 @@ from app.ai import run_analysis_sections
 
 router = APIRouter(prefix="/checkup", tags=["checkup"])
 
+
 # ----------------------------- Helpers -----------------------------
 
 def _clean_blurb(text: str) -> str:
@@ -28,14 +29,16 @@ def _clean_blurb(text: str) -> str:
         pass
     return cleaned.strip()
 
+
 def _triad_key(ids: List[float]) -> str:
     s = [f"{float(x):.2f}" for x in sorted(float(v) for v in ids)]
     return ",".join(s)
 
+
 async def _fetch_labels(session: AsyncSession, ids_sorted: List[float]) -> Dict[float, str]:
     """
-    Fetch human labels for the given program codes without assuming a specific column name.
-    We read the whole row as JSON and pick the first present key from a set of candidates.
+    Fetch human labels for the given program codes without assuming a fixed column name.
+    We read the whole row as JSON and pick the first sensible key.
     """
     res = await session.execute(
         sa_text("""
@@ -47,7 +50,7 @@ async def _fetch_labels(session: AsyncSession, ids_sorted: List[float]) -> Dict[
     )
     rows = res.fetchall()
     labels: Dict[float, str] = {}
-    candidates = ("title", "name", "program", "description")
+    candidates = ("label", "title", "name", "program", "description")
     for code, obj in rows:
         label = ""
         if isinstance(obj, dict):
@@ -55,14 +58,15 @@ async def _fetch_labels(session: AsyncSession, ids_sorted: List[float]) -> Dict[
                 if k in obj and obj[k]:
                     label = str(obj[k])
                     break
-        # last resort: echo the code itself if nothing usable found
         labels[float(code)] = label or f"{float(code):.2f}"
     return labels
+
 
 # ----------------------------- Models -----------------------------
 
 class StartIn(BaseModel):
     rah_ids: List[float] = Field(min_items=3, max_items=3)
+
 
 class StartOut(BaseModel):
     ok: bool = True
@@ -75,18 +79,22 @@ class StartOut(BaseModel):
     recommendations: Optional[str] = ""
     source: str  # "db" or "ai"
 
+
 class SaveAnswersIn(BaseModel):
     case_id: str
     selected: List[str] = []
     notes: Optional[str] = ""
 
+
 class AnalyzeIn(BaseModel):
     case_id: str
+
 
 class AnalyzeOut(BaseModel):
     case_id: str
     sections: Dict[str, Any]
     markdown: str
+
 
 # ----------------------------- Routes -----------------------------
 
@@ -95,20 +103,25 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
     ids_sorted = sorted(float(x) for x in payload.rah_ids)
     key = _triad_key(ids_sorted)
 
-    # Validate the 3 codes and fetch human labels (robust to column names)
+    # Validate the 3 codes and fetch human labels
     labels_map = await _fetch_labels(session, ids_sorted)
     if len(labels_map) != 3:
         raise HTTPException(
             status_code=400,
-            detail="Invalid RAH IDs. Only the 21 official physiologies (30–76) are accepted."
+            detail="Invalid RAH IDs. Only the 21 official physiologies (30–76) are accepted.",
         )
+    # Preserve the original input order for display
     rah_labels_in_input_order = [labels_map.get(float(x), "") for x in payload.rah_ids]
 
     # Look up the triad combination
     row = await session.execute(
         sa_text("""
-                SELECT combination_id::text, rah_ids, combination_title, analysis,
-                       potential_indications, recommendations
+                SELECT combination_id::text,
+                    rah_ids,
+                       combination_title,
+                       analysis,
+                       potential_indications,
+                       recommendations
                 FROM rah_schema.rah_combination_profiles
                 WHERE combo_key = :k
                     LIMIT 1
@@ -125,7 +138,7 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
             for group in ("Physical", "Psychological/Emotional", "Functional"):
                 items = list(pi.get(group, []) or [])
                 for i, text_item in enumerate(items):
-                    qid = f"{group[:3].upper()}-{i+1}"
+                    qid = f"{group[:3].upper()}-{i + 1}"
                     questions.append({"id": qid, "text": text_item, "group": group})
         except Exception:
             questions = []
@@ -159,7 +172,7 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
             source="db",
         )
 
-    # AI fallback
+    # AI fallback path – no curated triad yet, but we still create a case
     ins = await session.execute(
         sa_text("""
                 INSERT INTO rah_schema.checkup_case
@@ -183,6 +196,7 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
         source="ai",
     )
 
+
 @router.post("/answers")
 async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(get_session)):
     """Store practitioner selections/notes."""
@@ -195,7 +209,8 @@ async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(g
 
     exists = await session.execute(
         sa_text("""
-                SELECT 1 FROM rah_schema.checkup_case
+                SELECT 1
+                FROM rah_schema.checkup_case
                 WHERE case_id = CAST(:cid AS uuid)
                     LIMIT 1
                 """),
@@ -219,14 +234,18 @@ async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(g
     await session.commit()
     return {"ok": True}
 
+
 @router.post("/analyze", response_model=AnalyzeOut)
 async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_session)):
+    # Fetch case, including stored questions JSON
     case_q = await session.execute(
         sa_text("""
-                SELECT case_id::text, rah_ids,
+                SELECT case_id::text,
+                    rah_ids,
                        COALESCE(combination, '')      AS combination,
                        COALESCE(analysis_blurb, '')   AS analysis_blurb,
-                       COALESCE(recommendations, '')  AS recommendations
+                       COALESCE(recommendations, '')  AS recommendations,
+                       COALESCE(questions, '[]'::jsonb) AS questions
                 FROM rah_schema.checkup_case
                 WHERE case_id = CAST(:cid AS uuid)
                     LIMIT 1
@@ -237,6 +256,7 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
     if not case:
         raise HTTPException(status_code=404, detail="Unknown case_id")
 
+    # Answers (checkbox selections + notes)
     ans_q = await session.execute(
         sa_text("""
                 SELECT COALESCE(selected_ids, ARRAY[]::text[]) AS selected_ids,
@@ -251,6 +271,19 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
     selected_ids = list(ans[0]) if ans else []
     notes = str(ans[1] or "") if ans else ""
 
+    # Questions JSON – already stored as list[dict] in checkup_case.questions
+    raw_q = case[5]
+    if isinstance(raw_q, list):
+        questions: List[Dict[str, Any]] = raw_q
+    else:
+        # Defensive: try to decode if it came back as a JSON string
+        try:
+            decoded = json.loads(raw_q)
+            questions = decoded if isinstance(decoded, list) else []
+        except Exception:
+            questions = []
+
+    # Build analysis sections
     try:
         sections = await run_analysis_sections(
             rah_ids=[float(x) for x in case[1]],
@@ -259,6 +292,7 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
             selected_ids=selected_ids,
             notes=notes,
             recommendations=str(case[4] or ""),
+            questions=questions,
         )
     except Exception:
         sections = {
@@ -275,7 +309,9 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
             },
         }
 
-    def bullets(items): return "\n".join([f"- {x}" for x in (items or [])])
+    def bullets(items: List[str]) -> str:
+        return "\n".join([f"- {x}" for x in (items or [])])
+
     rec = sections.get("recommendations", {}) or {}
 
     md = f"""# RAI Analysis
@@ -309,6 +345,7 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
 {bullets(rec.get("follow_up", []))}
 """.strip()
 
+    # Persist result for history
     await session.execute(
         sa_text("""
                 INSERT INTO rah_schema.checkup_result (case_id, sections, markdown)
