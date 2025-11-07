@@ -2,20 +2,35 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
+from io import BytesIO
 import re
 import json
 
 from app.db import get_session
-from app.ai import run_analysis_sections
+from app.ai import run_analysis_sections, harmonise_bioresonance
+
+# PDF / ReportLab
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    ListFlowable,
+    ListItem,
+)
 
 router = APIRouter(prefix="/checkup", tags=["checkup"])
 
 
 # ----------------------------- Helpers -----------------------------
+
 
 def _clean_blurb(text: str) -> str:
     if not text:
@@ -41,11 +56,13 @@ async def _fetch_labels(session: AsyncSession, ids_sorted: List[float]) -> Dict[
     We read the whole row as JSON and pick the first sensible key.
     """
     res = await session.execute(
-        sa_text("""
-                SELECT program_code::numeric(5,2) AS code, to_jsonb(p) AS obj
-                FROM rah_schema.physiology_program p
-                WHERE program_code = ANY(:ids)
-                """),
+        sa_text(
+            """
+            SELECT program_code::numeric(5,2) AS code, to_jsonb(p) AS obj
+            FROM rah_schema.physiology_program p
+            WHERE program_code = ANY(:ids)
+            """
+        ),
         {"ids": ids_sorted},
     )
     rows = res.fetchall()
@@ -62,7 +79,176 @@ async def _fetch_labels(session: AsyncSession, ids_sorted: List[float]) -> Dict[
     return labels
 
 
+def _build_case_pdf(
+        *,
+        case_id: str,
+        rah_ids: List[float],
+        rah_labels: Optional[List[str]],
+        combination_title: str,
+        sections: Dict[str, Any],
+) -> bytes:
+    """
+    Build a nicely formatted PDF for a given case_id + analysis sections.
+
+    - rah_ids:      [42.0, 46.0, 58.0]
+    - rah_labels:   ["Respiratory system, physiology complete", ...]
+    - combination_title: e.g. "Nasal-Eustachian Tube-Eardrum"
+    - sections:     the JSON structure stored in checkup_result.sections
+    """
+
+    # Fall back to codes if labels list is empty/misaligned
+    if rah_labels and len(rah_labels) == len(rah_ids):
+        names = rah_labels
+    else:
+        names = [f"RAH {float(x):.2f}" for x in rah_ids]
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=20 * mm,
+        rightMargin=20 * mm,
+        topMargin=20 * mm,
+        bottomMargin=20 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "TitleH1",
+        parent=styles["Heading1"],
+        fontSize=18,
+        leading=22,
+        spaceAfter=6,
+    )
+    h2 = ParagraphStyle(
+        "H2",
+        parent=styles["Heading2"],
+        fontSize=14,
+        leading=18,
+        spaceBefore=8,
+        spaceAfter=4,
+    )
+    normal = ParagraphStyle(
+        "Body",
+        parent=styles["BodyText"],
+        fontSize=10,
+        leading=13,
+        spaceAfter=2,
+    )
+    subtle = ParagraphStyle(
+        "Subtle",
+        parent=normal,
+        textColor="#666666",
+        fontSize=8,
+        leading=10,
+        spaceAfter=2,
+    )
+
+    story: List[Any] = []
+
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
+    story.append(Paragraph("RAI Analysis Report", title_style))
+    story.append(Paragraph(f"Case ID: {case_id}", subtle))
+    story.append(Spacer(1, 6 * mm))
+
+    # ------------------------------------------------------------------
+    # Combination meta
+    # ------------------------------------------------------------------
+    if rah_ids:
+        codes_line = ", ".join(f"{x:.2f}" for x in rah_ids)
+        labels_line = ", ".join(names)
+        story.append(Paragraph("RAH Combination", h2))
+        story.append(Paragraph(f"Codes: {codes_line}", normal))
+        story.append(Paragraph(f"Physiologies: {labels_line}", normal))
+        if combination_title:
+            story.append(Paragraph(f"Profile: {combination_title}", normal))
+        story.append(Spacer(1, 5 * mm))
+
+    # ------------------------------------------------------------------
+    # Correlated Systems
+    # ------------------------------------------------------------------
+    corr = sections.get("correlated_systems") or []
+    if corr:
+        story.append(Paragraph("Correlated Systems Analysis", h2))
+        bullets = [
+            ListItem(Paragraph(str(c), normal), bulletColor="black") for c in corr
+        ]
+        story.append(ListFlowable(bullets, bulletType="bullet"))
+        story.append(Spacer(1, 4 * mm))
+
+    # ------------------------------------------------------------------
+    # Indication Interpretation
+    # ------------------------------------------------------------------
+    inds = sections.get("indications") or []
+    if inds:
+        story.append(Paragraph("Indication Interpretation", h2))
+        bullets = [
+            ListItem(
+                Paragraph(str(i).replace("**", ""), normal), bulletColor="black"
+            )
+            for i in inds
+        ]
+        story.append(ListFlowable(bullets, bulletType="bullet"))
+        story.append(Spacer(1, 4 * mm))
+
+    # ------------------------------------------------------------------
+    # Note Synthesis
+    # ------------------------------------------------------------------
+    note = (sections.get("note_synthesis") or "").strip()
+    if note:
+        story.append(Paragraph("Note Synthesis", h2))
+        story.append(Paragraph(note, normal))
+        story.append(Spacer(1, 4 * mm))
+
+    # ------------------------------------------------------------------
+    # 200-Word Diagnostic Summary
+    # ------------------------------------------------------------------
+    summary = (sections.get("diagnostic_summary") or "").strip()
+    if summary:
+        story.append(Paragraph("200-Word Diagnostic Summary", h2))
+        story.append(Paragraph(summary, normal))
+        story.append(Spacer(1, 6 * mm))
+
+    # ------------------------------------------------------------------
+    # Tailored Recommendations
+    # ------------------------------------------------------------------
+    rec = sections.get("recommendations") or {}
+    if any(
+            rec.get(k)
+            for k in ["lifestyle", "nutritional", "emotional", "bioresonance", "follow_up"]
+    ):
+        story.append(Paragraph("Tailored Recommendations", h2))
+        story.append(Spacer(1, 2 * mm))
+
+        def add_bucket(title: str, key: str) -> None:
+            items = rec.get(key) or []
+            if not items:
+                return
+            story.append(Paragraph(f"<b>{title}</b>", normal))
+            bullets = [
+                ListItem(Paragraph(str(i), normal), bulletColor="black")
+                for i in items
+            ]
+            story.append(ListFlowable(bullets, bulletType="bullet"))
+            story.append(Spacer(1, 2 * mm))
+
+        add_bucket("Lifestyle", "lifestyle")
+        add_bucket("Nutritional", "nutritional")
+        add_bucket("Emotional", "emotional")
+        add_bucket("Rayonex Bioresonance", "bioresonance")
+        add_bucket("Follow-Up", "follow_up")
+
+    # Build PDF
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # ----------------------------- Models -----------------------------
+
 
 class StartIn(BaseModel):
     rah_ids: List[float] = Field(min_items=3, max_items=3)
@@ -98,8 +284,11 @@ class AnalyzeOut(BaseModel):
 
 # ----------------------------- Routes -----------------------------
 
+
 @router.post("/start", response_model=StartOut)
-async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_session)):
+async def start_checkup(
+        payload: StartIn, session: AsyncSession = Depends(get_session)
+):
     ids_sorted = sorted(float(x) for x in payload.rah_ids)
     key = _triad_key(ids_sorted)
 
@@ -110,22 +299,25 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
             status_code=400,
             detail="Invalid RAH IDs. Only the 21 official physiologies (30–76) are accepted.",
         )
+
     # Preserve the original input order for display
     rah_labels_in_input_order = [labels_map.get(float(x), "") for x in payload.rah_ids]
 
     # Look up the triad combination
     row = await session.execute(
-        sa_text("""
-                SELECT combination_id::text,
-                    rah_ids,
-                       combination_title,
-                       analysis,
-                       potential_indications,
-                       recommendations
-                FROM rah_schema.rah_combination_profiles
-                WHERE combo_key = :k
-                    LIMIT 1
-                """),
+        sa_text(
+            """
+            SELECT combination_id::text,
+                rah_ids,
+                   combination_title,
+                   analysis,
+                   potential_indications,
+                   recommendations
+            FROM rah_schema.rah_combination_profiles
+            WHERE combo_key = :k
+                LIMIT 1
+            """
+        ),
         {"k": key},
     )
     comb = row.first()
@@ -143,6 +335,12 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
         except Exception:
             questions = []
 
+        # ORIGINAL recommendations text from the triad profile
+        original_reco = str(comb[5] or "")
+
+        # 🔁 Harmonise Rayonex Bioresonance once, so Stage 3 and 4 share it
+        patched_reco, _bio_lines = harmonise_bioresonance(ids_sorted, original_reco)
+
         ins = await session.execute(
             sa_text("""
                     INSERT INTO rah_schema.checkup_case
@@ -155,7 +353,7 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
                 "comb": str(comb[2] or ""),
                 "blurb": _clean_blurb(str(comb[3] or "")),
                 "qs": json.dumps(questions),
-                "reco": str(comb[5] or ""),
+                "reco": patched_reco,
             },
         )
         case_id = ins.scalar_one()
@@ -168,18 +366,21 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
             combination_title=str(comb[2] or ""),
             analysis_blurb=_clean_blurb(str(comb[3] or "")),
             questions=questions,
-            recommendations=str(comb[5] or ""),
+            recommendations=patched_reco,  # 👈 this is what Stage 3 shows
             source="db",
         )
 
-    # AI fallback path – no curated triad yet, but we still create a case
+
+# AI fallback path – no curated triad yet, but we still create a case
     ins = await session.execute(
-        sa_text("""
-                INSERT INTO rah_schema.checkup_case
-                (rah_ids, combination, analysis_blurb, questions, recommendations, source)
-                VALUES (:rah, '', '', '[]'::jsonb, '', 'ai')
-                    RETURNING case_id::text
-                """),
+        sa_text(
+            """
+            INSERT INTO rah_schema.checkup_case
+            (rah_ids, combination, analysis_blurb, questions, recommendations, source)
+            VALUES (:rah, '', '', '[]'::jsonb, '', 'ai')
+                RETURNING case_id::text
+            """
+        ),
         {"rah": ids_sorted},
     )
     case_id = ins.scalar_one()
@@ -198,7 +399,9 @@ async def start_checkup(payload: StartIn, session: AsyncSession = Depends(get_se
 
 
 @router.post("/answers")
-async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(get_session)):
+async def save_answers(
+        payload: SaveAnswersIn, session: AsyncSession = Depends(get_session)
+):
     """Store practitioner selections/notes."""
     cid = (payload.case_id or "").strip()
     if not cid:
@@ -208,27 +411,31 @@ async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(g
     notes = (payload.notes or "").strip()
 
     exists = await session.execute(
-        sa_text("""
-                SELECT 1
-                FROM rah_schema.checkup_case
-                WHERE case_id = CAST(:cid AS uuid)
-                    LIMIT 1
-                """),
+        sa_text(
+            """
+            SELECT 1
+            FROM rah_schema.checkup_case
+            WHERE case_id = CAST(:cid AS uuid)
+                LIMIT 1
+            """
+        ),
         {"cid": cid},
     )
     if exists.first() is None:
         raise HTTPException(status_code=404, detail="Unknown case_id")
 
     await session.execute(
-        sa_text("""
-                INSERT INTO rah_schema.checkup_answers (case_id, selected_ids, notes)
-                VALUES (CAST(:cid AS uuid), CAST(:sel AS text[]), :notes)
-                    ON CONFLICT (case_id)
-            DO UPDATE SET
-                    selected_ids = EXCLUDED.selected_ids,
-                                       notes        = EXCLUDED.notes,
-                                       updated_at   = now()
-                """),
+        sa_text(
+            """
+            INSERT INTO rah_schema.checkup_answers (case_id, selected_ids, notes)
+            VALUES (CAST(:cid AS uuid), CAST(:sel AS text[]), :notes)
+                ON CONFLICT (case_id)
+        DO UPDATE SET
+                selected_ids = EXCLUDED.selected_ids,
+                               notes        = EXCLUDED.notes,
+                               updated_at   = now()
+            """
+        ),
         {"cid": cid, "sel": selected, "notes": notes},
     )
     await session.commit()
@@ -239,17 +446,19 @@ async def save_answers(payload: SaveAnswersIn, session: AsyncSession = Depends(g
 async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_session)):
     # Fetch case, including stored questions JSON
     case_q = await session.execute(
-        sa_text("""
-                SELECT case_id::text,
-                    rah_ids,
-                       COALESCE(combination, '')      AS combination,
-                       COALESCE(analysis_blurb, '')   AS analysis_blurb,
-                       COALESCE(recommendations, '')  AS recommendations,
-                       COALESCE(questions, '[]'::jsonb) AS questions
-                FROM rah_schema.checkup_case
-                WHERE case_id = CAST(:cid AS uuid)
-                    LIMIT 1
-                """),
+        sa_text(
+            """
+            SELECT case_id::text,
+                rah_ids,
+                   COALESCE(combination, '')      AS combination,
+                   COALESCE(analysis_blurb, '')   AS analysis_blurb,
+                   COALESCE(recommendations, '')  AS recommendations,
+                   COALESCE(questions, '[]'::jsonb) AS questions
+            FROM rah_schema.checkup_case
+            WHERE case_id = CAST(:cid AS uuid)
+                LIMIT 1
+            """
+        ),
         {"cid": payload.case_id},
     )
     case = case_q.first()
@@ -258,13 +467,15 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
 
     # Answers (checkbox selections + notes)
     ans_q = await session.execute(
-        sa_text("""
-                SELECT COALESCE(selected_ids, ARRAY[]::text[]) AS selected_ids,
-                       COALESCE(notes, '')                    AS notes
-                FROM rah_schema.checkup_answers
-                WHERE case_id = CAST(:cid AS uuid)
-                    LIMIT 1
-                """),
+        sa_text(
+            """
+            SELECT COALESCE(selected_ids, ARRAY[]::text[]) AS selected_ids,
+                   COALESCE(notes, '')                    AS notes
+            FROM rah_schema.checkup_answers
+            WHERE case_id = CAST(:cid AS uuid)
+                LIMIT 1
+            """
+        ),
         {"cid": payload.case_id},
     )
     ans = ans_q.first()
@@ -347,16 +558,93 @@ async def analyze(payload: AnalyzeIn, session: AsyncSession = Depends(get_sessio
 
     # Persist result for history
     await session.execute(
-        sa_text("""
-                INSERT INTO rah_schema.checkup_result (case_id, sections, markdown)
-                VALUES (CAST(:cid AS uuid), CAST(:sec AS jsonb), :md)
-                    ON CONFLICT (case_id)
-            DO UPDATE SET
-                    sections = EXCLUDED.sections,
-                                       markdown = EXCLUDED.markdown
-                """),
+        sa_text(
+            """
+            INSERT INTO rah_schema.checkup_result (case_id, sections, markdown)
+            VALUES (CAST(:cid AS uuid), CAST(:sec AS jsonb), :md)
+                ON CONFLICT (case_id)
+        DO UPDATE SET
+                sections = EXCLUDED.sections,
+                               markdown = EXCLUDED.markdown
+            """
+        ),
         {"cid": payload.case_id, "sec": json.dumps(sections), "md": md},
     )
     await session.commit()
 
     return AnalyzeOut(case_id=payload.case_id, sections=sections, markdown=md)
+
+
+# ----------------------------- PDF Route -----------------------------
+
+
+@router.get("/report/{case_id}/pdf")
+async def download_report(case_id: str, session: AsyncSession = Depends(get_session)):
+    """
+    Return a server-side generated PDF for an analyzed case.
+    Requires that /checkup/analyze has already been run for this case_id
+    (so that rah_schema.checkup_result has a row).
+    """
+    cid = (case_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="case_id required")
+
+    # 1) Fetch the base case info
+    case_q = await session.execute(
+        sa_text(
+            """
+            SELECT rah_ids, COALESCE(combination, '') AS combination
+            FROM rah_schema.checkup_case
+            WHERE case_id = CAST(:cid AS uuid)
+                LIMIT 1
+            """
+        ),
+        {"cid": cid},
+    )
+    case = case_q.first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Unknown case_id")
+
+    rah_ids = [float(x) for x in (case[0] or [])]
+    combination_title = str(case[1] or "")
+
+    # Fetch labels for the PDF header
+    labels_map = await _fetch_labels(session, sorted(rah_ids))
+    rah_labels = [labels_map.get(x, f"RAH {x:.2f}") for x in rah_ids]
+
+    # 2) Fetch analyzed sections (must exist)
+    res_q = await session.execute(
+        sa_text(
+            """
+            SELECT sections
+            FROM rah_schema.checkup_result
+            WHERE case_id = CAST(:cid AS uuid)
+                LIMIT 1
+            """
+        ),
+        {"cid": cid},
+    )
+    res_row = res_q.first()
+    if not res_row:
+        raise HTTPException(
+            status_code=400,
+            detail="Analysis not yet generated for this case. Run RAI Analyze first.",
+        )
+
+    sections = res_row[0] or {}
+
+    pdf_bytes = _build_case_pdf(
+        case_id=cid,
+        rah_ids=rah_ids,
+        rah_labels=rah_labels,
+        combination_title=combination_title,
+        sections=sections,
+    )
+
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="rai-report-{cid}.pdf"'
+        },
+    )

@@ -1,6 +1,6 @@
 // frontend/src/ui/Checkup.tsx
 import { useMemo, useState } from "react";
-import { startCheckup, saveCheckupAnswers, analyzeCheckup } from "../api";
+import { startCheckup, saveCheckupAnswers, analyzeCheckup, downloadCheckupPdf } from "../api";
 
 type Question = { id: string; text: string; group: "Physical" | "Psychological/Emotional" | "Functional" };
 type StartResp = {
@@ -237,7 +237,7 @@ export default function Checkup() {
                                     {(grouped[g] || []).length === 0 ? (
                                         <div className="text-sm text-gray-500">No items.</div>
                                     ) : (
-                                        <ul className="list-disc pl-5 space-y-2">
+                                        <ul className="pl-5 space-y-2">
                                             {grouped[g].map((q) => {
                                                 const checked = selected.includes(q.id);
                                                 return (
@@ -312,6 +312,29 @@ export default function Checkup() {
                             <button className="text-sm px-3 py-1.5 border rounded hover:bg-gray-50" onClick={() => copyText(resultMd)}>
                                 📋 Copy
                             </button>
+                            {caseId && (
+                                <button
+                                    className="text-sm px-3 py-1.5 border rounded hover:bg-gray-50"
+                                    onClick={async () => {
+                                        try {
+                                            const blob = await downloadCheckupPdf(caseId);
+                                            const url = URL.createObjectURL(blob);
+                                            const a = document.createElement("a");
+                                            a.href = url;
+                                            a.download = `rai-report-${caseId}.pdf`;
+                                            document.body.appendChild(a);
+                                            a.click();
+                                            a.remove();
+                                            URL.revokeObjectURL(url);
+                                        } catch (e) {
+                                            console.error(e);
+                                            alert("PDF download failed");
+                                        }
+                                    }}
+                                >
+                                    🧾 PDF report
+                                </button>
+                            )}
                         </div>
                     </div>
                     <div className="prose px-6 py-6 max-w-none">

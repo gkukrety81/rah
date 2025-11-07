@@ -148,3 +148,12 @@ export async function translateCheckup(caseId: string, lang = "de") {
 }
 
 /* ========= (Optional) other existing API helpers can live here ========= */
+export async function downloadCheckupPdf(caseId: string): Promise<Blob> {
+    const res = await fetch(`/api/checkup/report/${caseId}/pdf`, {
+        method: "GET",
+    });
+    if (!res.ok) {
+        throw new Error(`PDF download failed: ${res.status}`);
+    }
+    return await res.blob();
+}

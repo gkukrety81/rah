@@ -149,6 +149,7 @@ def _recommendations_from_text(blob: str) -> Dict[str, List[str]]:
         low = line.lower()
         moved = False
         for needle, key in headings:
+            # treat a line with 'X:' near start as a heading
             if needle in low and ":" in low[:40]:
                 current = key
                 moved = True
@@ -167,6 +168,104 @@ def _recommendations_from_text(blob: str) -> Dict[str, List[str]]:
     if not any(buckets.values()):
         return _recommendations_from_text("")
     return buckets
+
+
+# --------------------------------------------------------------------
+#  NEW: harmonise_bioresonance
+#  - removes raw program-number bullets
+#  - keeps a single "After individual balancing…" line
+#  - adds generic Rayonex suggestions based on keywords
+# --------------------------------------------------------------------
+
+
+def harmonise_bioresonance(
+        rah_ids: List[float], recommendations_text: str
+) -> tuple[str, List[str]]:
+    """
+    Take the free-text recommendations blob and normalise the
+    Rayonex Bioresonance section.
+
+    Returns:
+        (patched_recommendations_text, bio_bullets)
+    """
+
+    text = (recommendations_text or "").replace("\r\n", "\n")
+    lower = text.lower()
+    header = "Rayonex Bioresonance:"
+
+    # Strip any existing Rayonex block – we’ll replace it.
+    idx = lower.find("rayonex bioresonance")
+    if idx != -1:
+        base = text[:idx].rstrip()
+    else:
+        base = text.rstrip()
+
+    # Build the canonical "after individual balancing" line
+    names = [
+        PHYSIO_LABELS.get(float(x), f"RAH {float(x):.2f}")
+        for x in sorted(float(v) for v in (rah_ids or []))
+    ]
+    if len(names) == 3:
+        combo_phrase = (
+            f"After individual balancing, use combination programs that address "
+            f"{names[0]}, {names[1]} and {names[2]} together to harmonise their interaction."
+        )
+    elif names:
+        combo_phrase = (
+                "After individual balancing, use combination programs that address "
+                + ", ".join(names)
+                + " together to harmonise their interaction."
+        )
+    else:
+        combo_phrase = (
+            "After individual balancing, use combination programs that support the "
+            "key physiologies involved to harmonise their interaction."
+        )
+
+    bullets: List[str] = [combo_phrase]
+
+    # Use the FULL original text (before stripping) for keyword detection
+    keyword_text = lower
+
+    def add_if(words: List[str], sentence: str) -> None:
+        if any(w in keyword_text for w in words) and sentence not in bullets:
+            bullets.append(sentence)
+
+    add_if(
+        ["detox", "toxin"],
+        "Use programs that support detoxification and elimination pathways alongside lifestyle changes.",
+    )
+    add_if(
+        ["energy", "fatigue", "tired"],
+        "Use programs that support overall energy, vitality, and recovery.",
+    )
+    add_if(
+        ["digest", "bloat", "indigestion", "gut", "nutrition", "diet"],
+        "Use programs that support digestion and nutrient absorption alongside nutritional changes.",
+    )
+    add_if(
+        ["immune", "infection", "inflamm"],
+        "Use immune-modulating frequencies to support balanced inflammatory and defence responses.",
+    )
+    add_if(
+        ["stress", "anxiety", "emotional", "mood"],
+        "Use stress-regulation and emotional balancing programs to complement relaxation techniques.",
+    )
+    add_if(
+        ["sleep", "insomnia"],
+        "Use programs that promote restorative sleep and circadian balance.",
+    )
+
+    # Compose new Rayonex block (no RAH numbers)
+    bio_block_lines = [header] + ["- " + s for s in bullets]
+    new_section = "\n".join(bio_block_lines)
+
+    if base:
+        patched = base + "\n\n" + new_section
+    else:
+        patched = new_section
+
+    return patched, bullets
 
 
 # --------------------------------------------------------------------
@@ -190,13 +289,6 @@ async def rewrite_indications_to_questions(
     """
     Take the JSON structure from rah_combination_profiles.potential_indications
     and rewrite each item as a short, client-friendly yes/no symptom question.
-
-    Structure:
-        {
-          "Physical": [...],
-          "Psychological/Emotional": [...],
-          "Functional": [...]
-        }
     """
     if not potential_indications:
         return {}
